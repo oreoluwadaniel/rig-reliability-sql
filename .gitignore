@@ -1,0 +1,6 @@
+# Local scratch and database artefacts
+*.dump
+*.log
+*.bak
+.DS_Store
+.env
