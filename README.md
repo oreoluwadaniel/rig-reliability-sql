@@ -1,152 +1,698 @@
-# RigWatch
+# RigWatch: Asset Reliability, Maintenance & Risk Intelligence System
 
-**Asset reliability analytics for oil and gas operations, in PostgreSQL.**
-
-Three thousand maintenance events across wells, pipelines and refineries, turned into a maintenance team's Monday morning list.
+**A PostgreSQL decision-support system for maintenance spend, equipment reliability, downtime exposure, and risk-based asset prioritization across oil and gas operations.**
 
 ---
 
-## What this is
+## Project Overview
 
-An operations dataset covering equipment failures, production output and emissions, analysed in SQL to answer three questions a maintenance function actually has to answer:
+Oil and gas operators manage large asset portfolios where equipment failures, unplanned downtime, maintenance costs, and operational risk compete for the same limited maintenance resources.
 
-1. Where is the budget going, and is it going to assets worth the money?
-2. What is breaking, how often, and how much operating time does it cost?
-3. Of three thousand assets, which ones get inspected this week?
+The challenge is not simply knowing which equipment has failed.
 
-Each question is a separate project with its own script and its own documentation. They share a dataset and a schema, and each one stands alone.
+Management needs to know:
 
-| Project | Question | Files |
-|---|---|---|
-| **01** Maintenance Cost and Spend Efficiency | Where is the money going, and is it earning its keep? | [README](01-maintenance-cost-analysis/README.md) · [SQL](01-maintenance-cost-analysis/maintenance_cost_analysis.sql) |
-| **02** Failure Frequency and Downtime Exposure | What is breaking, and what does it cost in lost hours? | [README](02-failure-downtime-analysis/README.md) · [SQL](02-failure-downtime-analysis/failure_downtime_analysis.sql) |
-| **03** Asset Risk Scoring and Prioritisation | Which assets do we go and look at first? | [README](03-asset-risk-prioritisation/README.md) · [SQL](03-asset-risk-prioritisation/asset_risk_prioritisation.sql) |
+> **Where is maintenance budget being spent?**
+> **Which assets are repeatedly failing?**
+> **Where is downtime exposure concentrated?**
+> **Which equipment deserves maintenance attention first?**
 
----
+RigWatch addresses that problem by transforming maintenance, production, and emissions data into a **reliability and maintenance decision-support system** for wells, pipelines, and refineries.
 
-## The part worth reading first
+Using 3,000 maintenance events alongside production and emissions records, the repository evaluates asset performance across three connected areas:
 
-This started as a single working script. Before rewriting anything I reviewed it line by line, and the review turned up problems serious enough that the original output would have pointed a maintenance team at the wrong assets.
+1. **Maintenance Cost & Spend Efficiency**
+2. **Failure Frequency & Downtime Exposure**
+3. **Asset Risk Scoring & Maintenance Prioritization**
 
-Every project README documents its own findings in full. The summary:
+The final objective is practical:
 
-| Problem | Where | Why it mattered |
-|---|---|---|
-| Three way join fan-out in the reliability view | Original view | Assets appeared as many rows instead of one. Every total, count and average taken off the view was inflated, by a different multiple per asset |
-| Same fan-out in two aggregate queries | Original queries 4 and 8 | Downtime, cost and production totals all too high, and the ratios between them meaningless |
-| A join artefact reported as a failure count | Original query 6 | `COUNT(*)` off the broken view returned maintenance events times production readings times emissions readings, labelled `failures` |
-| Comments contradicted the code | Original query 9 | Documentation said 8 events and 120 hours across three tiers. Code said 3 events and 100 hours across four |
-| Sequential CASE let one dimension override another | Original query 9 | An asset with 4 failures and 20 lost hours outranked one with 3 failures and 600 lost hours |
-| Two definitions of "risky" in one file | Original queries 7 and 9 | More than 5 failures in one, more than 3 in the other, for the same concept |
-| Join key mismatch across asset types | Everywhere production was joined | Pipelines and refineries returned NULL production and read as assets that burn money and produce nothing |
-| Currency stored as text, cast to FLOAT | Wherever cost appeared | Inexact arithmetic on money, and no type enforcement on load |
-| No table definitions at all | Whole script | Nobody else could run it, and it hid the type problem |
-| No unique key on maintenance events | Source data | No safe way to count distinct failures after any join |
-
-The fan-out is the one worth understanding if you only look at one. It is the kind of bug that produces output looking entirely reasonable, with no errors, no nulls and no obviously silly numbers. The totals are simply too big, by an amount that varies per row, so you cannot even correct for it afterwards.
-
-The original script is kept in [`original/`](original/) so the before and after can be compared directly.
+> Turn thousands of operational records into a defensible list of assets the maintenance team should inspect first.
 
 ---
 
-## The data
+# Business Problem
 
-Ten CSVs came with the dataset. These three projects use three of them.
+Maintenance teams rarely have unlimited technicians, inspection capacity, or budget.
 
-| File | Rows | Grain | Used in |
-|---|---|---|---|
-| `maintenance.csv` | 3,000 | One maintenance event | 01, 02, 03 |
-| `production.csv` | 5,000 | One well reading per date | 01, 02, 03 |
-| `emissions.csv` | 3,000 | One asset reading per date | 03 |
+When thousands of assets compete for attention, prioritizing work based only on the most recent failure, the highest maintenance bill, or fixed thresholds can direct resources toward the wrong equipment.
 
-Asset IDs carry their type in the prefix: `WEL` for wells, `PIP` for pipelines, `REF` for refineries. The `asset_class()` helper in the schema decodes this, and it matters more than it looks. Production data covers wells only, so without labelling the asset class a refinery shows up as an asset with high maintenance spend and zero output. It produces no barrels because it is a refinery, not because it is failing.
+An effective reliability strategy needs to consider several dimensions together:
 
-**Known limits, stated up front:**
+* Maintenance Spend
+* Failure Frequency
+* Downtime Exposure
+* Production Performance
+* Asset Type
+* Emissions Exposure
+* Relative Fleet Risk
 
-- Production covers wells only. Pipelines and refineries carry NULL in those columns.
-- There is no date alignment between the tables. A 2018 failure and a 2024 production reading belong to the same asset and to different moments. Totals are lifetime totals and are labelled as such.
-- Downtime has a date and a duration but no start time. So the data can say an asset lost 90 hours. It cannot say whether they fell during production or during a planned shutdown, and that is the difference between hours lost and barrels lost.
+These dimensions answer different questions.
+
+An expensive asset is not automatically inefficient.
+
+A refinery showing no production in a well-production dataset is not automatically failing.
+
+An asset with many maintenance events is not necessarily more urgent than one with fewer failures but hundreds of hours of downtime.
+
+RigWatch brings these signals together to help maintenance teams distinguish:
+
+> **High cost from poor cost efficiency**
+
+> **Frequent maintenance from operationally significant failure**
+
+> **Historical activity from current maintenance priority**
 
 ---
 
-## Running it
+# Operational Questions
 
-Needs PostgreSQL 12 or later. Tested on 14.
+The repository is designed around three management questions.
 
-```bash
-createdb rigwatch
+### 1. Where is maintenance budget going?
 
-# open sql/00_schema.sql and uncomment the three \copy lines first
-psql -d rigwatch -f sql/00_schema.sql
+Management needs visibility into maintenance expenditure and whether high-spend assets justify that investment through operational performance.
 
-psql -d rigwatch -f 01-maintenance-cost-analysis/maintenance_cost_analysis.sql
-psql -d rigwatch -f 02-failure-downtime-analysis/failure_downtime_analysis.sql
-psql -d rigwatch -f 03-asset-risk-prioritisation/asset_risk_prioritisation.sql
+### 2. What is breaking, and what is the operational consequence?
+
+Failure counts alone are insufficient.
+
+Maintenance teams also need to understand downtime duration, failure patterns, and where reliability problems are concentrated.
+
+### 3. Which assets should be inspected first?
+
+With thousands of assets and limited maintenance capacity, the final output needs to convert reliability data into a prioritized worklist.
+
+That is the core purpose of RigWatch.
+
+---
+
+# The Three Analysis Modules
+
+| Project                                        | Business Question                                                            | Decision Supported                                            |
+| ---------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| **01 - Maintenance Cost & Spend Efficiency**   | Where is maintenance money being spent, and which assets justify that spend? | Budget allocation and maintenance cost optimization           |
+| **02 - Failure Frequency & Downtime Exposure** | Which assets fail most often, and where is operating time being lost?        | Reliability improvement and downtime reduction                |
+| **03 - Asset Risk Scoring & Prioritization**   | Which assets require maintenance attention first?                            | Inspection planning and risk-based maintenance prioritization |
+
+Each module has its own SQL script and documentation while operating from the same underlying reliability data model.
+
+---
+
+# System Architecture
+
+```text
+                     OIL & GAS ASSET DATA
+                              |
+              ---------------------------------
+              |               |               |
+              ↓               ↓               ↓
+         MAINTENANCE      PRODUCTION       EMISSIONS
+              |               |               |
+              ↓               ↓               ↓
+          Event-Level      Well-Level       Asset-Level
+            History         Output            Exposure
+              |               |               |
+              ---------------------------------
+                              |
+                              ↓
+                     DATA VALIDATION LAYER
+                              |
+                    -----------------------
+                    |                     |
+                    ↓                     ↓
+              Grain Validation       Asset Classification
+                    |                     |
+                    -----------------------
+                              |
+                              ↓
+                      ASSET-LEVEL MODEL
+                              |
+          ------------------------------------------------
+          |                      |                       |
+          ↓                      ↓                       ↓
+    Maintenance Spend       Failure & Downtime        Emissions
+       Intelligence             Intelligence          Exposure
+          |                      |                       |
+          ------------------------------------------------
+                              |
+                              ↓
+                     RELIABILITY SCORING
+                              |
+                              ↓
+                    RELATIVE FLEET RISK
+                              |
+                              ↓
+                MAINTENANCE PRIORITY ENGINE
+                              |
+                ------------------------------
+                |             |              |
+                ↓             ↓              ↓
+             MONITOR        REVIEW        PRIORITIZE
+                                             |
+                                             ↓
+                                 MAINTENANCE WORKLIST
 ```
 
-The schema file ends with sanity checks: row counts, asset type breakdown, join coverage, duplicate detection and null checks. Run them after loading. If the duplicate check shows more than one row per asset on either table, that is the fan-out condition the corrected scripts are built to handle, and it confirms why the original was wrong.
+---
 
-Every figure in the project READMEs is reproducible from these three CSVs and the schema. Clone it and check.
+# Data
+
+Ten CSV files were supplied with the wider operational dataset. RigWatch uses three.
+
+| Dataset           |  Rows | Grain                      | Role                                             |
+| ----------------- | ----: | -------------------------- | ------------------------------------------------ |
+| `maintenance.csv` | 3,000 | One maintenance event      | Failure, downtime, and maintenance cost analysis |
+| `production.csv`  | 5,000 | One well reading per date  | Production performance analysis                  |
+| `emissions.csv`   | 3,000 | One asset reading per date | Environmental exposure within risk analysis      |
+
+Asset IDs encode equipment type through their prefixes:
+
+| Prefix | Asset Type |
+| ------ | ---------- |
+| `WEL`  | Well       |
+| `PIP`  | Pipeline   |
+| `REF`  | Refinery   |
+
+The schema includes an `asset_class()` helper function that converts these identifiers into explicit asset classes.
+
+This classification is important because the source datasets do not cover every asset type equally.
 
 ---
 
-## Techniques used
+# Known Data Limitations
 
-| Technique | Where and why |
-|---|---|
-| Common table expressions | The fix for the fan-out. Pre-aggregate each table to one row per asset, then join |
-| `PERCENT_RANK()` | Scores assets on a 0 to 1 scale so dollars, hours and event counts can be combined without inventing exchange rates |
-| `PERCENTILE_CONT()` | Derives thresholds from the data instead of hardcoding them |
-| `NTILE()` | Readable quartile bands for efficiency and emissions grouping |
-| `SUM() OVER (ORDER BY ... ROWS BETWEEN ...)` | Running cumulative share, for the concentration analysis |
-| `SUM(COUNT(*)) OVER (PARTITION BY ...)` | Share within group without a second pass |
-| `LAG()` | Year on year change |
-| `MODE() WITHIN GROUP` | Each asset's most common failure type |
-| `COUNT(*) FILTER (WHERE ...)` | Multiple conditional counts in one pass, for the data quality checks |
-| `NUMERIC` over `FLOAT` | Exact decimal arithmetic on currency |
-| `NULLIF()` | Guards every division |
-| A SQL helper function | Asset type decoding in one place instead of repeated in every query |
+The system documents several limitations rather than hiding them behind the analysis.
+
+### Production Covers Wells Only
+
+Production records represent wells.
+
+Pipelines and refineries therefore contain `NULL` production values.
+
+A refinery with no production record does not represent a non-performing asset. It represents an asset for which barrel production is not the appropriate performance measure.
+
+This distinction prevents valid infrastructure assets from being incorrectly classified as high-cost, zero-output equipment.
+
+### Tables Are Not Temporally Aligned
+
+Maintenance, production, and emissions records contain dates, but the datasets do not provide sufficient alignment to establish that activity across the three tables occurred during the same operating period.
+
+The model therefore treats aggregated figures as:
+
+> **Lifetime totals**
+
+rather than pretending they represent synchronized operational windows.
+
+### Downtime Is Not Production Loss
+
+Maintenance records provide downtime duration but not sufficient timing information to determine whether those hours overlapped active production.
+
+The system can therefore measure:
+
+> **Hours of downtime**
+
+but cannot defensibly claim:
+
+> **Barrels of production lost**
+
+without additional operational data.
 
 ---
 
-## Why percentiles instead of fixed thresholds
+# Critical Data Modeling Problems Identified
 
-The main methodological choice in the repo, so it is worth being direct about the trade off.
+The original SQL executed successfully, but several issues could materially distort the maintenance decisions produced from it.
 
-Fixed thresholds have two failure modes. Nobody can explain where the number came from, so it cannot be defended when challenged. And it goes stale silently: a threshold set when the fleet averaged 2 failures per asset means something different once the fleet averages 6, and nothing in the code announces that it has stopped working.
+That distinction is central to this project:
 
-Percentile thresholds describe a position in the fleet. The worst 10 percent is the worst 10 percent whatever the underlying numbers do, and it means something in plain English.
-
-The cost is real. Percentile thresholds always flag roughly the same proportion, so if the whole fleet improves, the same share still gets flagged. For a work prioritisation list that is correct, because the team's capacity has not changed either. For a safety limit it would be wrong, and an absolute threshold would be right there.
+> **SQL that runs is not necessarily SQL that supports the right decision.**
 
 ---
 
-## A note on the numbers
+## 1. Three-Way Join Fan-Out
 
-The scripts, corrections and reasoning here are complete and were written after reading the source data. The specific figures each query returns come from running it against your loaded database, which takes about a minute once the schema is in place. Nothing in this documentation quotes a result that was not derived from the data or the code itself.
+The most significant issue occurred when maintenance, production, and emissions records were joined directly at asset level.
 
----
+Each table can contain multiple observations for the same asset.
 
-## Repository layout
+For example:
 
+```text
+Asset WEL001
+
+Maintenance Events:    4
+Production Readings:  10
+Emissions Readings:    5
 ```
+
+A direct join can produce:
+
+```text
+4 × 10 × 5 = 200 rows
+```
+
+for one asset.
+
+The asset does not suddenly have 200 meaningful observations.
+
+The join created them.
+
+---
+
+## Business Consequence
+
+Fan-out can inflate:
+
+* Maintenance Costs
+* Downtime Hours
+* Failure Counts
+* Production Totals
+* Emissions Totals
+
+Worse, the inflation factor can differ by asset because each asset has different numbers of records.
+
+This means there is no universal correction factor that can safely repair the results afterwards.
+
+A maintenance team using these figures could:
+
+* Misidentify high-cost assets
+* Miscalculate downtime exposure
+* Misrank reliability risk
+* Allocate technicians to the wrong equipment
+* Direct maintenance budget away from assets with greater operational need
+
+---
+
+## Solution: Pre-Aggregate Before Joining
+
+Each operational dataset is first reduced to the correct asset-level grain.
+
+```text
+Maintenance Events
+       |
+       ↓
+Aggregate by Asset
+       |
+       ----------------
+                      |
+Production Readings  |
+       |              |
+       ↓              ↓
+Aggregate by Asset → ASSET MODEL
+                      ↑
+       ↓              |
+Aggregate by Asset    |
+       ↑              |
+       |              |
+Emissions Readings ---
+```
+
+This creates one summary row per asset from each source before those summaries are joined.
+
+The corrected model therefore combines:
+
+> **One maintenance summary**
+
+> **One production summary**
+
+> **One emissions summary**
+
+per asset.
+
+This protects every downstream KPI and risk score from many-to-many row multiplication.
+
+---
+
+# Additional Logic Problems Corrected
+
+The review identified several other issues affecting analytical reliability.
+
+| Issue                                               | Business Risk                                              | Correction                                            |
+| --------------------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------- |
+| Join fan-out in reliability view                    | Inflated operational KPIs                                  | Pre-aggregate sources to asset grain                  |
+| Fan-out in aggregate queries                        | Incorrect cost, production, and downtime totals            | Aggregate independently before joining                |
+| `COUNT(*)` used as failure count                    | Join artefacts reported as real failures                   | Count from the maintenance event grain                |
+| Comments disagreed with implemented thresholds      | Maintenance logic could be misunderstood                   | Align documentation and executable logic              |
+| Sequential `CASE` prioritization                    | One risk dimension could override a more severe one        | Use multidimensional relative scoring                 |
+| Two definitions of risky assets                     | Same asset could be classified differently across analyses | Standardize risk methodology                          |
+| Production joined across incompatible asset classes | Pipelines/refineries appeared to produce nothing           | Explicit asset classification and NULL interpretation |
+| Currency represented as text/`FLOAT`                | Weak monetary precision and validation                     | Use `NUMERIC`                                         |
+| Missing table definitions                           | Analysis was not reproducible                              | Build complete PostgreSQL schema                      |
+| No maintenance event identifier                     | Distinct event counting unsafe after joins                 | Preserve source grain and validate duplicates         |
+
+---
+
+# Module 01: Maintenance Cost & Spend Efficiency
+
+## Objective
+
+Determine where maintenance budget is being consumed and whether that expenditure aligns with asset performance.
+
+The analysis evaluates:
+
+* Total Maintenance Spend
+* Spend by Asset
+* Spend Concentration
+* Maintenance Cost Distribution
+* Cost Relative to Production Where Applicable
+* Asset Efficiency Bands
+
+The objective is not simply to identify:
+
+> **"Which asset costs the most?"**
+
+but:
+
+> **"Which assets consume significant maintenance resources relative to the operational value they provide?"**
+
+---
+
+## Business Value
+
+Maintenance expenditure should not be evaluated in isolation.
+
+A high-producing well may justify greater maintenance expenditure than a lower-output asset.
+
+This module helps management distinguish between:
+
+> **High spend that supports productive equipment**
+
+and
+
+> **High spend that may indicate poor asset economics or recurring reliability problems.**
+
+This supports more disciplined maintenance budgeting and asset-level cost review.
+
+---
+
+# Module 02: Failure Frequency & Downtime Exposure
+
+## Objective
+
+Identify where equipment reliability problems are concentrated and quantify their operational consequences.
+
+The analysis evaluates:
+
+* Failure Frequency
+* Downtime Hours
+* Failure Types
+* Asset-Level Reliability Patterns
+* Downtime Concentration
+* Year-on-Year Changes
+
+Failure frequency and downtime are deliberately treated as separate dimensions.
+
+Consider:
+
+```text
+Asset A
+4 maintenance events
+20 downtime hours
+
+Asset B
+3 maintenance events
+600 downtime hours
+```
+
+A model driven only by event count could rank Asset A as the larger problem.
+
+Operationally, Asset B may deserve far greater attention.
+
+RigWatch preserves both dimensions rather than allowing one metric to determine reliability priority on its own.
+
+---
+
+# Module 03: Asset Risk Scoring & Maintenance Prioritization
+
+## Objective
+
+Convert multiple reliability signals into a prioritized maintenance worklist.
+
+This module combines asset-level indicators such as:
+
+* Maintenance Frequency
+* Downtime Exposure
+* Maintenance Spend
+* Production Performance Where Applicable
+* Emissions Exposure
+
+The purpose is to answer the maintenance team's most practical question:
+
+> **"Of all the assets we operate, which ones deserve attention first?"**
+
+---
+
+# Why Relative Risk Scoring Is Used
+
+A central methodological decision in RigWatch is the use of percentile-based risk scoring instead of relying entirely on fixed thresholds.
+
+Hardcoded rules such as:
+
+```text
+Failures > 5
+```
+
+or:
+
+```text
+Downtime > 100 hours
+```
+
+create two problems.
+
+### Threshold Origin
+
+If the threshold has no engineering, regulatory, or historical basis, it is difficult to defend.
+
+Why five failures?
+
+Why 100 hours?
+
+Without evidence, those numbers are assumptions embedded in SQL.
+
+### Threshold Drift
+
+Fleet behavior changes.
+
+If average failure frequency rises from two events to six, a threshold created under the earlier operating environment may no longer identify unusually risky assets.
+
+The code still runs.
+
+The threshold simply becomes less useful.
+
+---
+
+# Percentile-Based Prioritization
+
+`PERCENT_RANK()` places assets on a comparable 0-to-1 scale based on their position within the fleet.
+
+This allows different measures such as:
+
+* Dollars
+* Downtime Hours
+* Event Counts
+
+to contribute to prioritization without pretending they share the same units.
+
+A maintenance manager can then interpret a result such as:
+
+> **This asset sits within the highest-risk portion of the fleet**
+
+without needing to interpret several incompatible raw measures simultaneously.
+
+---
+
+# The Trade-Off
+
+Percentile scoring is appropriate for **work prioritization**, not every reliability problem.
+
+If the entire fleet improves dramatically, percentile scoring will still identify a worst-performing group.
+
+That is useful when the question is:
+
+> **"We can inspect 30 assets this week. Which 30 should they be?"**
+
+It is not appropriate for absolute engineering or safety limits.
+
+If an equipment condition becomes unsafe beyond a defined physical threshold, that absolute threshold should override relative fleet ranking.
+
+RigWatch therefore uses percentile logic as a **maintenance prioritization method**, not as a substitute for engineering safety standards.
+
+---
+
+# Techniques Used
+
+| Technique                     | Purpose                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| Common Table Expressions      | Pre-aggregate operational tables and prevent fan-out                 |
+| `PERCENT_RANK()`              | Normalize different risk dimensions onto a comparable relative scale |
+| `PERCENTILE_CONT()`           | Derive thresholds from fleet distributions                           |
+| `NTILE()`                     | Create interpretable performance bands                               |
+| Windowed `SUM()`              | Measure cumulative spend or risk concentration                       |
+| `SUM(COUNT(*)) OVER (...)`    | Calculate within-group shares efficiently                            |
+| `LAG()`                       | Measure year-over-year change                                        |
+| `MODE() WITHIN GROUP`         | Identify each asset's most common failure type                       |
+| `COUNT(*) FILTER (WHERE ...)` | Perform conditional data-quality and operational counts              |
+| `NUMERIC`                     | Preserve exact arithmetic for maintenance expenditure                |
+| `NULLIF()`                    | Protect ratio calculations against division by zero                  |
+| SQL Helper Function           | Decode asset classes consistently throughout the repository          |
+
+---
+
+# Data Validation
+
+The PostgreSQL schema includes validation checks covering:
+
+* Row Counts
+* Asset Type Distribution
+* Join Coverage
+* Duplicate Detection
+* NULL Values
+* Source Grain
+
+These checks are part of the analytical system rather than one-time development queries.
+
+They provide an early warning when changes in source data could compromise downstream reliability metrics.
+
+---
+
+# Business Impact
+
+RigWatch turns maintenance analytics into an **operational prioritization capability**.
+
+The system helps management improve four areas.
+
+### Maintenance Budget Allocation
+
+Spend analysis identifies where maintenance resources are concentrated and where expenditure requires deeper review.
+
+### Reliability Management
+
+Failure and downtime analysis identifies assets contributing disproportionately to operational reliability problems.
+
+### Maintenance Prioritization
+
+Risk scoring converts thousands of records into a ranked worklist that helps maintenance teams focus limited inspection capacity on the assets with the greatest relative exposure.
+
+### Decision Quality
+
+Correcting fan-out, asset-type mismatches, inconsistent thresholds, and unsafe event counting protects maintenance decisions from technically plausible but analytically incorrect results.
+
+The shift is from:
+
+> **"How many failures did we record?"**
+
+to:
+
+> **"Which assets create the greatest operational exposure, and where should our maintenance capacity go first?"**
+
+That is the core business value of RigWatch.
+
+---
+
+# Skills Demonstrated
+
+This repository demonstrates proficiency in:
+
+* PostgreSQL
+* Asset Reliability Analytics
+* Maintenance Analytics
+* Oil & Gas Operations Analytics
+* Operational Risk Analysis
+* Maintenance Cost Analysis
+* Downtime Analysis
+* Asset Prioritization
+* Data Modeling
+* SQL Debugging
+* Data Quality Engineering
+* Window Functions
+* Percentile-Based Scoring
+* KPI Development
+* Decision Support Systems
+* Analytical Validation
+
+---
+
+# Repository Structure
+
+```text
 rig-reliability-sql/
 ├── README.md
 ├── data/
 │   ├── maintenance.csv
 │   ├── production.csv
 │   └── emissions.csv
+│
 ├── sql/
 │   └── 00_schema.sql
+│
 ├── original/
 │   └── predictive_maintenance_original.sql
+│
 ├── 01-maintenance-cost-analysis/
 │   ├── README.md
 │   └── maintenance_cost_analysis.sql
+│
 ├── 02-failure-downtime-analysis/
 │   ├── README.md
 │   └── failure_downtime_analysis.sql
+│
 └── 03-asset-risk-prioritisation/
     ├── README.md
     └── asset_risk_prioritisation.sql
 ```
+
+---
+
+# Running the Project
+
+Requires **PostgreSQL 12 or later** and was tested on PostgreSQL 14.
+
+```bash
+createdb rigwatch
+
+# Open sql/00_schema.sql and uncomment the required \copy statements
+psql -d rigwatch -f sql/00_schema.sql
+
+# Maintenance Cost & Spend Efficiency
+psql -d rigwatch -f 01-maintenance-cost-analysis/maintenance_cost_analysis.sql
+
+# Failure Frequency & Downtime Exposure
+psql -d rigwatch -f 02-failure-downtime-analysis/failure_downtime_analysis.sql
+
+# Asset Risk Scoring & Prioritization
+psql -d rigwatch -f 03-asset-risk-prioritisation/asset_risk_prioritisation.sql
+```
+
+After loading the data, run the sanity checks included at the end of the schema before relying on the analytical outputs.
+
+---
+
+# Results
+
+RigWatch delivers a three-layer asset reliability system covering:
+
+> **Maintenance Spend Intelligence**
+
+> **Failure & Downtime Intelligence**
+
+> **Risk-Based Maintenance Prioritization**
+
+The repository transforms 3,000 maintenance events, 5,000 production readings, and 3,000 emissions observations into asset-level reliability intelligence designed to support real maintenance decisions.
+
+More importantly, the project demonstrates why analytical correctness matters operationally.
+
+The original implementation contained data-model and scoring issues capable of inflating reliability metrics and changing which assets appeared most urgent.
+
+The corrected architecture establishes the proper data grain, protects financial and reliability calculations from join fan-out, separates asset classes correctly, standardizes risk methodology, and produces a defensible basis for maintenance prioritization.
+
+The final outcome is not simply a collection of SQL queries.
+
+It is a system designed to help an operations team answer:
+
+> **Where are we spending maintenance money?**
+
+> **Where are reliability problems creating the greatest operational exposure?**
+
+> **And when maintenance capacity is limited, which assets should we inspect first?**
