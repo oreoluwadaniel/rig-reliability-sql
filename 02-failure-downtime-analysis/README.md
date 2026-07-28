@@ -1,259 +1,1111 @@
-# Project 02: Failure Frequency and Downtime Exposure
+# Failure & Downtime Intelligence System
 
-**What is actually breaking, how often, and how much operating time does it cost us?**
-
-Script: [`failure_downtime_analysis.sql`](failure_downtime_analysis.sql)
-Database: PostgreSQL 14
-Setup required: run [`../sql/00_schema.sql`](../sql/00_schema.sql) first
+**A PostgreSQL reliability analytics project that identifies recurring equipment failures, measures operational downtime, isolates the failure modes causing the most disruption, and prioritizes high-production wells where lost operating hours matter most.**
 
 ---
 
-## 1. Business Problem
+## Business Problem
 
-Maintenance gets measured in money because money is easy to measure. It is usually the wrong measure.
+Maintenance spend tells you how much it cost to repair an asset.
 
-The cost of a repair is what you paid the contractor. The cost of the failure is the production you did not sell while the asset sat idle. Those two numbers are not related to each other in any reliable way. A seal costs very little and can stop a well for three days. A planned overhaul costs a great deal and is scheduled for a window when nothing is running.
+It does not tell you how much the failure cost the operation.
 
-So a maintenance function that only tracks spend is watching the smaller of the two numbers and missing the larger one entirely.
+A relatively inexpensive component can stop production for days. A costly overhaul may happen during a planned maintenance window with limited operational impact.
 
-This project looks at the other side. It asks which assets fail most often, where the lost hours accumulate, which types of fault do the most damage, and whether reliability across the fleet is holding steady or slipping.
+That means maintenance cost alone is a poor measure of reliability.
 
-There is a second question underneath the first one, and it is the more useful one. Two assets can lose the same hundred hours in completely different ways. One loses them across twenty short stoppages. The other loses them in a single week long outage. Those are different problems with different causes and different fixes, and a report that ranks on total hours alone cannot tell them apart. Getting that distinction into the output is most of the value of this analysis.
+The more important questions are:
 
-## 2. Data Source
+> **What keeps breaking, how often does it happen, how long does each failure keep the asset offline, and where should reliability teams intervene first?**
 
-Two tables out of the ten CSV files in this dataset.
+There is another distinction that matters just as much.
 
-**`maintenance.csv`**, 3,000 events. The core table for this project. Every row is one failure and its consequences.
+Consider two assets that each accumulated 100 hours of downtime.
 
-| Column | What it holds |
-|---|---|
-| `asset_id` | The asset. Prefix says what kind: WEL, PIP or REF |
-| `maintenance_date` | When it failed |
-| `cost_usd` | Repair cost |
-| `failure_type` | Category of fault, for example Pump Failure, Corrosion, Electrical Fault |
-| `downtime_hours` | Hours the asset was out of service |
+```text
+Asset A
+20 failures
+5 hours average downtime
 
-**`production.csv`**, 5,000 readings. Used only where downtime needs to be weighed against what the asset produces.
+Asset B
+1 failure
+100 hours downtime
+```
 
-| Column | What it holds |
-|---|---|
-| `well_id` | The well |
-| `production_date` | Date of the reading |
-| `oil_production_barrels`, `gas_production_mcf` | Volumes |
-| `water_cut_pct`, `pressure_psi`, `temperature_c` | Operating conditions |
+Both lost the same number of hours.
 
-Two limits worth stating before anyone reads the output.
+They do not have the same reliability problem.
 
-The production table holds wells only. Pipelines and refineries appear in maintenance but have no production rows, so any query comparing downtime to barrels is restricted to wells.
+Asset A suggests a recurring fault that may never have been eliminated at root cause.
 
-There is no timestamp on the downtime, only a date and a duration. So the analysis can say an asset lost 90 hours across the period. It cannot say whether those hours fell during peak production or during a shutdown when nothing was running anyway. Worth knowing before treating lost hours as directly equal to lost barrels.
+Asset B suggests a severe outage where repair complexity, parts availability, or maintenance planning may be the bigger issue.
 
-## 3. Methodology
+A single downtime total hides that distinction.
 
-Frequency first, then duration, then cause, then trend. Each layer answers something the one before it raised.
+This project builds a reliability analysis that separates:
 
-**Frequency, with time attached.** Counting failures per asset is the obvious starting point and it is not enough on its own. Six failures over six years is routine. Six failures over six months is an asset coming apart. Same count, opposite conclusion. So the first query carries the date range and the average gap between failures alongside the count. The average gap is the closest thing this dataset offers to mean time between failures, which is the standard reliability measure, and it is what turns a count into a judgement.
+* How often assets fail
+* How severe those failures are
+* Which failure modes create the most downtime
+* Where downtime is concentrated across the fleet
+* Which high-production wells also carry high downtime exposure
+* Whether reliability is improving or deteriorating over time
 
-**Duration, kept separate from frequency.** Total downtime per asset, with the average per failure and the worst single outage next to it. Three columns instead of one, because the shape of the downtime is the diagnosis. Many short stoppages usually means a recurring fault nobody has traced to root cause. One very long stoppage usually means a part that was not in stores. Reporting only the total hides which of the two you are dealing with.
+The result is a system for deciding **where engineering and maintenance attention can recover the most operating availability.**
 
-**Concentration.** The same cumulative share approach used in project 01, applied to hours instead of dollars. This decides what kind of recommendation is possible. If a small number of assets carry most of the lost hours, a targeted programme will move the number. If the hours are spread thinly across hundreds of assets, targeting will not work and the answer has to be systemic.
+---
 
-**Cause, ranked by damage rather than by count.** Failure types sorted by total downtime, not by how often they occur. Those two orderings are usually different and the difference is the point. A fault that happens 400 times and clears in two hours is an irritation. A fault that happens 40 times and takes three days is where the production went.
+# Business Value
 
-**Cause, split by asset type.** Wells, pipelines and refineries do not fail the same way. Averaging across all three produces a number that describes none of them. This is the query that tells a planner whether corrosion is a pipeline problem or everybody's problem.
+The analysis moves maintenance reporting from:
 
-**Downtime against production, done correctly.** The corrected version of the query the original script got wrong. Details in section 4.
+> **How much did we spend fixing equipment?**
 
-**Downtime where the barrels are.** Lost hours on a poor producer are a nuisance. The same hours on a top producer are lost revenue. This ranks wells on both dimensions and keeps only the ones that are bad on both.
+to:
 
-**Trend.** Failures and hours by year. Position is arguable, direction is not.
+> **Where are failures disrupting operations, what is driving that disruption, and which problems should we fix first?**
 
-## 4. Analysis and Error Check
+The decision flow is:
 
-I went through the original script query by query. Here is what was wrong in the four queries belonging to this project.
+```text
+MAINTENANCE EVENTS
+        |
+        v
+FAILURE FREQUENCY
+        |
+        v
+FAILURE CADENCE
+        |
+        +----------------------+
+                               |
+DOWNTIME ----------------------+
+                               |
+FAILURE TYPE ------------------+
+                               |
+                               v
+                     RELIABILITY EXPOSURE
+                               |
+                +--------------+--------------+
+                |                             |
+                v                             v
+        RECURRING FAULTS              SEVERE OUTAGES
+                |                             |
+                v                             v
+        ROOT CAUSE WORK             PLANNING / SPARES
+                \                             /
+                 \                           /
+                  +------------+------------+
+                               |
+                               v
+                       PRODUCTION EXPOSURE
+                               |
+                               v
+                    MAINTENANCE PRIORITIES
+```
 
-### The join fan-out in the downtime versus production query
+Instead of treating every maintenance event as equivalent, the project distinguishes between problems requiring different operational responses.
 
-This was the significant one. The original:
+---
+
+# What the System Answers
+
+The analysis answers eight reliability questions.
+
+### 1. Which assets fail most frequently?
+
+Identify equipment with repeated maintenance events.
+
+### 2. How quickly do failures repeat?
+
+Add time context so six failures over six months are not treated the same as six failures over six years.
+
+### 3. Which assets create the most downtime?
+
+Rank equipment by total operating hours lost.
+
+### 4. Is downtime caused by repeated short failures or isolated major outages?
+
+Measure average downtime per failure and worst individual outage.
+
+### 5. Which failure modes create the most operational disruption?
+
+Rank failure types by total downtime rather than frequency alone.
+
+### 6. Do different asset classes fail differently?
+
+Separate failure patterns across wells, pipelines, and refineries.
+
+### 7. Which high-production wells also suffer heavy downtime?
+
+Combine production importance with reliability exposure.
+
+### 8. Is fleet reliability improving or deteriorating?
+
+Track failure activity and downtime over time.
+
+---
+
+# Data
+
+The project uses two operational datasets.
+
+| Dataset           | Records | Role                                                         |
+| ----------------- | ------: | ------------------------------------------------------------ |
+| `maintenance.csv` |   3,000 | Failure events, maintenance cost, failure type, and downtime |
+| `production.csv`  |   5,000 | Well production and operating readings                       |
+
+---
+
+## Maintenance Data
+
+Each row represents a maintenance event.
+
+Key fields include:
+
+| Field              | Purpose                                 |
+| ------------------ | --------------------------------------- |
+| `asset_id`         | Identifies the asset and asset class    |
+| `maintenance_date` | Date of the maintenance event           |
+| `cost_usd`         | Maintenance cost                        |
+| `failure_type`     | Recorded failure category               |
+| `downtime_hours`   | Duration of lost operating availability |
+
+Asset prefixes identify equipment type:
+
+* `WEL` = Well
+* `PIP` = Pipeline
+* `REF` = Refinery
+
+---
+
+## Production Data
+
+Production readings contain:
+
+* Oil production
+* Gas production
+* Water cut
+* Pressure
+* Temperature
+
+Production records exist for **wells only**.
+
+Pipelines and refineries therefore remain part of the failure and downtime analysis but are excluded from comparisons requiring production volume.
+
+---
+
+# Analytical Framework
+
+The project moves from detection to diagnosis to prioritization.
+
+```text
+                FAILURE EVENTS
+                      |
+                      v
+             HOW OFTEN?
+            Failure Frequency
+                      |
+                      v
+             HOW QUICKLY AGAIN?
+             Failure Cadence
+                      |
+                      v
+              HOW SEVERE?
+             Downtime Exposure
+                      |
+                      v
+              WHAT FAILED?
+           Failure Mode Analysis
+                      |
+                      v
+              WHERE IS THE
+            DOWNTIME CONCENTRATED?
+                      |
+                      v
+             WHAT ASSET TYPE?
+                      |
+                      v
+             HOW MUCH DOES THE
+               ASSET PRODUCE?
+                      |
+                      v
+            WHERE SHOULD WE
+               INTERVENE?
+```
+
+Each analytical layer answers a question raised by the previous one.
+
+---
+
+# Methodology
+
+## Step 1: Measure Failure Frequency With Time Context
+
+A raw failure count is useful but incomplete.
+
+Suppose two assets each recorded six failures.
+
+```text
+Asset A
+6 failures over 6 years
+
+Asset B
+6 failures over 6 months
+```
+
+The count is identical.
+
+The reliability signal is not.
+
+The first query therefore calculates:
+
+* Failure count
+* First recorded failure
+* Most recent failure
+* Observation period
+* Average days between failures
+
+The average interval provides a practical approximation of failure cadence from the available data.
+
+A shorter interval indicates failures are recurring more rapidly.
+
+---
+
+## Step 2: Measure Downtime Severity
+
+Failure frequency tells us how often equipment breaks.
+
+Downtime tells us how disruptive those failures are.
+
+For each asset, the analysis calculates:
+
+* Total downtime
+* Failure count
+* Average downtime per failure
+* Worst individual outage
+* Total downtime expressed in days
+
+This separates two fundamentally different reliability patterns.
+
+### Pattern A: Chronic Repeat Failure
+
+```text
+High failure count
++
+High total downtime
++
+Low average downtime per event
+```
+
+The asset repeatedly stops for relatively short periods.
+
+That points toward unresolved recurring failure mechanisms.
+
+### Pattern B: Major Outage Exposure
+
+```text
+Lower failure count
++
+High total downtime
++
+High average downtime per event
+```
+
+The asset fails less frequently, but individual failures are severe.
+
+That may point toward repair complexity, spare-part availability, or maintenance planning.
+
+Same total downtime.
+
+Different diagnosis.
+
+Different response.
+
+---
+
+# Step 3: Measure Downtime Concentration
+
+Not every fleet should be managed the same way.
+
+If 15 assets create most of the downtime, a targeted reliability program can materially improve fleet availability.
+
+If downtime is distributed across hundreds of assets, fixing a handful of equipment will not solve the problem.
+
+The project therefore calculates:
+
+* Downtime by asset
+* Each asset's share of total downtime
+* Running cumulative downtime share
+
+Conceptually:
+
+```text
+Assets Ranked by Downtime
+
+Asset 01  ███████████████
+Asset 02  ████████████
+Asset 03  █████████
+Asset 04  ███████
+Asset 05  █████
+...
+```
+
+The cumulative view answers:
+
+> **Is reliability exposure concentrated enough for targeted intervention to work?**
+
+That question should be answered before designing the intervention.
+
+---
+
+# Step 4: Rank Failure Modes by Operational Damage
+
+The most common failure is not automatically the most important failure.
+
+Consider:
+
+```text
+Failure Type A
+400 occurrences
+2 hours average downtime
+= 800 downtime hours
+
+Failure Type B
+50 occurrences
+30 hours average downtime
+= 1,500 downtime hours
+```
+
+Failure Type A occurs eight times more frequently.
+
+Failure Type B removes almost twice as much operating time.
+
+A frequency-only ranking would prioritize the wrong problem.
+
+The project therefore evaluates each failure type using:
+
+* Number of occurrences
+* Total downtime
+* Average downtime
+* Worst individual outage
+* Total maintenance cost
+* Share of all failures
+* Share of all downtime
+
+The primary ranking is based on **total downtime**.
+
+This shifts the question from:
+
+> What breaks most?
+
+to:
+
+> **What failure mode removes the most operating availability?**
+
+---
+
+# Step 5: Separate Failure Patterns by Asset Class
+
+Wells, pipelines, and refineries are different operating systems.
+
+Combining their failure behavior into one fleet-wide average can hide the patterns that matter within each class.
+
+The analysis therefore breaks failure modes down by:
+
+* Well
+* Pipeline
+* Refinery
+
+This allows maintenance strategy to move from:
+
+> One reliability program for everything
+
+to:
+
+> **Different reliability interventions for different asset classes.**
+
+If corrosion dominates pipeline downtime but not well downtime, a fleet-wide corrosion initiative would waste resources.
+
+The analysis makes that distinction visible.
+
+---
+
+# Step 6: Compare Downtime With Production
+
+Downtime becomes more economically important when it affects high-output equipment.
+
+The project therefore compares well-level downtime against well production.
+
+But doing this correctly required fixing a structural SQL problem in the original analysis.
+
+---
+
+# SQL Review & Model Corrections
+
+## 1. The Original Production Join Multiplied Rows
+
+The original logic joined maintenance directly to production:
 
 ```sql
-SELECT m.asset_id,
-       SUM(m.downtime_hours) AS downtime,
-       SUM(p.oil_production_barrels) AS production
+SELECT
+    m.asset_id,
+    SUM(m.downtime_hours) AS downtime,
+    SUM(p.oil_production_barrels) AS production
 FROM maintenance m
-LEFT JOIN production p ON m.asset_id = p.well_id
+LEFT JOIN production p
+    ON m.asset_id = p.well_id
 GROUP BY m.asset_id;
 ```
 
-`maintenance` holds many rows per asset. `production` holds many rows per well. Joining them at row level produces every combination of the two before the aggregation runs.
+The problem is grain.
 
-Take a well with 4 maintenance events and 3 production readings. The join returns 12 rows. `SUM(m.downtime_hours)` then adds each downtime value three times, once for each production reading it got paired with. `SUM(p.oil_production_barrels)` adds each production value four times, once per maintenance event.
+Both tables contain multiple records per asset.
 
-Both figures come out too high. Worse, the inflation factor is different for every asset, because it depends on how many rows each one happens to have on each side. The output is not uniformly wrong by some constant you could divide out. It is wrong by a different amount in every row.
+Suppose one well has:
 
-The reason this survives review is that the output looks fine. No errors, no nulls, no obviously absurd values. Just numbers that are too big.
+```text
+4 maintenance events
+3 production readings
+```
 
-**Fixed** by aggregating maintenance and production separately in CTEs, then joining the two one row per asset summaries. Each asset now contributes its downtime once and its production once.
+A direct join creates:
 
-### The same query silently dropped non well assets
+```text
+4 × 3 = 12 rows
+```
 
-`maintenance.asset_id` includes pipelines and refineries. `production.well_id` does not. The LEFT JOIN returns NULL production for all of them, and they sit in the results looking like assets with heavy downtime and no output.
+The maintenance records repeat across production records.
 
-**Fixed** with an `asset_class()` helper that labels each asset from its ID prefix, and a filter restricting the production comparison to wells. Pipelines and refineries are still analysed for frequency and downtime in queries 2.1 through 2.5 where no production data is needed.
+The production records repeat across maintenance records.
 
-### Failure counts with no time context
+As a result:
 
-The original frequency query returned `asset_id` and `COUNT(*)`, sorted descending. Correct SQL, incomplete analysis. A raw count cannot distinguish an asset that failed six times in its first year from one that failed six times over a decade, and those two assets need entirely different responses.
+* Downtime is inflated
+* Production is inflated
+* The inflation factor varies by asset
 
-**Fixed** by adding the first and last failure dates, the days covered, and the average gap between failures. The `COUNT(*) > 1` guard on the average matters: an asset with a single failure has no gap to measure, and dividing by `COUNT(*) - 1` would be a divide by zero without it.
+This last point is critical.
 
-### Failure types ranked by the wrong measure
+The output cannot be corrected by simply dividing every result by the same number.
 
-The original ordered failure types by occurrence count and reported average downtime as a secondary column. That answers "what is most common". The question worth asking is "what costs us most", and the answer is usually a different failure type.
+Each asset has a different combination of maintenance and production records.
 
-Average downtime alone does not fix it either, because a rare fault with a long average still may not amount to much in total. What you need is total downtime by failure type, which the original never calculated.
+The SQL executes successfully.
 
-**Fixed** by adding total downtime, total cost, worst single outage, and each type's share of all failures and all downtime, sorted on total downtime.
+The output looks plausible.
 
-### Downtime reported only as a total
-
-Sorting assets by total hours puts the frequent minor offenders and the rare catastrophic ones in the same list with nothing to separate them. The original script explicitly said in its comments that it wanted to tell these apart, and then did not calculate the columns that would have done it.
-
-**Fixed** by adding the average hours per failure, the worst single outage and the total expressed in days.
-
-### What was correct
-
-The three simple aggregations in the original, failure count by asset, total downtime by asset, and occurrences by failure type, all group correctly and produce accurate numbers as far as they go. I have kept the logic and built context columns around it. The issue with those three was never accuracy, it was that they answered a narrower question than the business was asking.
-
-## 5. Insight
-
-**Frequency and duration point at different assets, and both lists are needed.** The asset that fails most often is rarely the asset that loses the most hours. Frequency identifies unresolved root causes. Duration identifies where production actually went. Running one and not the other means missing half the problem, and the original script's outputs did not let you see that they were different lists.
-
-**The shape of an asset's downtime is the diagnosis, and it is free to calculate.** Total hours divided by failure count separates the two failure patterns immediately. High total with a low average is a repeat fault, and the fix is engineering. High total with a high average is a long outage, and the fix is usually spares availability or planning. Same headline number, different department, different budget. Query 2.2 makes this visible in a column that costs nothing to add.
-
-**Most common and most damaging are different failure types.** Ranking by count promotes whatever fails frequently and clears quickly. Ranking by total downtime promotes whatever stops the asset for days. The second ranking is the one that maps to lost production, and it is the ranking the original script did not produce.
-
-**Failure patterns are specific to asset type.** Aggregating corrosion across wells, pipelines and refineries produces an average that matches none of them. Query 2.5 splits it, and the split is what makes the output actionable for a planner who works on one class of kit.
-
-**Downtime only converts to money where there are barrels.** Query 2.7 is the shortlist that follows from this. Wells in the worst quarter for downtime and the best quarter for production are where lost hours become lost revenue. Every other combination is less urgent, and a report that does not make this distinction sends the team to the wrong sites.
-
-**Direction beats position in any conversation about reliability.** Whether 40,000 hours is a lot is arguable. Whether it has risen every year for five years is not. Query 2.8 is the one that gets a decision made.
-
-## 6. Recommendation
-
-**Split the top of the downtime list into two groups before assigning any work.** Use the average hours per failure column from query 2.2. Repeat offenders with short outages go to reliability engineering for root cause. Single long outages go to planning and spares. Sending both to the same team wastes the effort, because the two problems have nothing in common except the number they produce.
-
-**Attack failure types by total downtime, starting from the top of query 2.4.** The top two or three types by total hours will account for a large share of all lost production. Fixing a fault mode across the whole fleet scales in a way that fixing individual assets does not.
-
-**Build the maintenance programme per asset type, not for the fleet.** Query 2.5 gives the dominant fault mode for wells, for pipelines and for refineries separately. Three focused programmes will beat one general one.
-
-**Work query 2.7 first.** These are high downtime wells that also produce heavily, so this is where an hour recovered is worth the most. It is a short list by construction and it is the most defensible place to start.
-
-**Report the trend in query 2.8 to management every quarter, and report it as a trend.** A single lifetime total invites debate about whether it is normal. A line going the wrong way for five years does not.
-
-**Fix the timestamp gap in how downtime is recorded.** Right now there is a date and a duration but no start time. That means nobody can say whether an outage hit during production or during a planned shutdown, and that distinction is the difference between hours lost and barrels lost. It is a change to the capture process rather than to the analysis, and it would improve every reliability number reported from this data.
-
-## 7. Business Impact
-
-**Lost production becomes visible as its own number.** Tracking spend measures what was paid to fix things. Tracking downtime measures what the failure actually cost. The second number is usually much larger and it is the one that justifies preventive work at budget time.
-
-**Repair effort gets aimed at the right problem.** Separating repeat faults from long outages routes each to the team that can fix it. Today both sit in the same list, so both get the same generic response and neither gets solved.
-
-**Fleet wide fixes replace asset by asset firefighting.** Fixing the dominant failure mode across every well is a different scale of intervention from repairing one pump. Query 2.4 identifies which mode is worth that effort, which is a question the original ranking could not answer.
-
-**The most valuable hours get recovered first.** Query 2.7 puts effort where downtime costs the most, so a fixed amount of maintenance capacity returns more production.
-
-**Corrected numbers restore trust in the comparison.** The downtime against production figures were inflated on both sides by a varying multiple. Any conclusion drawn from them was unreliable. The fix makes the comparison usable again, and that is a prerequisite for everything above.
-
-**Reliability becomes a trend rather than an anecdote.** Once the yearly view exists, deferring maintenance shows up as a rising line rather than as a saving. That changes how the decision gets discussed.
-
-## 8. What Was Done
-
-Reviewed the four failure and downtime queries in the original script and documented every issue found, including the join fan-out that made the downtime against production output wrong rather than just incomplete.
-
-Rebuilt that query with pre-aggregated CTEs so each asset contributes its downtime once and its production once, and scoped it to wells so the comparison is valid.
-
-Added time context to the failure frequency query so a count becomes a rate, including a guard against dividing by zero for assets with a single failure.
-
-Extended the downtime query with the average per failure, the worst single outage and a days conversion, so frequent minor stoppages can be told apart from rare major ones.
-
-Rewrote the failure type analysis to rank on total downtime rather than occurrence count, and added cost, worst case and share of total columns.
-
-Added a failure type by asset type breakdown so wells, pipelines and refineries are analysed separately.
-
-Added a downtime concentration query with cumulative share, to establish whether a targeted programme is viable before recommending one.
-
-Added a cross ranking that isolates high downtime wells that are also high producers.
-
-Added a year on year reliability trend, which the original had no equivalent of.
-
-Documented the two data limitations that constrain interpretation: production covers wells only, and downtime has no start time.
-
-## 9. Tools Used and How They Helped
-
-**PostgreSQL 14.** Window functions, `FILTER`, `NTILE` and date arithmetic all work out of the box, so the whole analysis stays in SQL. No export step means no version of the numbers that can drift from the source.
-
-**Common table expressions.** The fix for the fan-out. Pre-aggregating each table before the join is the correction, and CTEs make it legible. Written as nested subqueries it would work identically and be much harder to review, which matters when part of the purpose is to show the reasoning.
-
-**Window functions.** `SUM() OVER ()` supplies the grand total to every row for the percentage columns. `SUM() OVER (ORDER BY ... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` builds the cumulative share. `SUM(COUNT(*)) OVER (PARTITION BY ...)` in query 2.5 gives each failure type its share within its own asset class, which is an aggregate inside a window and saves an entire extra join. `LAG()` handles the year on year comparison.
-
-**`NTILE(4)`.** Used in query 2.7 to rank wells on downtime and production at the same time. Quartiles let two different scales be compared without inventing a conversion between hours and barrels.
-
-**PostgreSQL date subtraction.** `MAX(date) - MIN(date)` returns an integer number of days directly, which is what makes the average gap between failures a one line calculation.
-
-**`CASE WHEN COUNT(*) > 1`.** Guards the average gap calculation. Assets with one failure have no interval to measure and would otherwise divide by zero.
-
-**`NULLIF()`.** Guards every other division in the script, including the percentage change calculation where the prior year could be zero.
-
-**Explicit `::NUMERIC` casts.** Integer division in PostgreSQL truncates, so `total_oil / downtime_hours` on two integer columns silently drops the decimals. Casting one side first keeps the precision.
-
-## 10. Results
-
-Eight outputs, each answering a specific question.
-
-| Query | What it gives you |
-|---|---|
-| 2.1 | Failure count per asset with date range and average days between failures |
-| 2.2 | Total downtime per asset with average per failure, worst single outage and days lost |
-| 2.3 | Assets ranked by downtime with share of total and running cumulative share |
-| 2.4 | Failure types ranked by total downtime, with cost, worst case and share columns |
-| 2.5 | Failure types split by asset type, with each type's share within its own class |
-| 2.6 | Wells with downtime, cost and production side by side, double counting removed |
-| 2.7 | The shortlist: wells in the worst quarter for downtime and the best quarter for production |
-| 2.8 | Failures and lost hours by year with change on the prior year |
-
-The concrete outcomes.
-
-Query 2.6 now returns correct figures. The previous version inflated both downtime and production by a multiplier that varied per asset, so the ratio between them was meaningless.
-
-Query 2.2 makes the repeat fault versus long outage distinction readable at a glance, which is the distinction that determines who fixes it.
-
-Query 2.4 reorders failure types by damage rather than by frequency, which changes which fault modes get engineering attention.
-
-Query 2.7 produces a short, defensible list of the wells where an hour of downtime costs the most.
-
-Query 2.3 establishes whether a targeted programme can work at all, before anyone designs one.
-
-Query 2.8 gives management a direction rather than a number, which is what tends to move a decision.
-
-Every result is reproducible from the schema file and the three source CSVs.
+The numbers are still wrong.
 
 ---
 
-### Files
+## Correction: Aggregate First, Join Second
 
+The corrected architecture is:
+
+```text
+MAINTENANCE
+     |
+     v
+Aggregate by Asset
+     |
+     +--------------------+
+                          |
+PRODUCTION                |
+     |                    |
+     v                    |
+Aggregate by Well --------+
+                          |
+                          v
+                 ASSET-LEVEL COMPARISON
 ```
+
+Maintenance is first reduced to one row per asset.
+
+Production is independently reduced to one row per well.
+
+Only then are the summaries joined.
+
+That guarantees each asset contributes its downtime once and its production once.
+
+---
+
+## 2. Production Comparison Included Assets That Do Not Produce Wells Data
+
+Maintenance covers:
+
+* Wells
+* Pipelines
+* Refineries
+
+Production covers wells only.
+
+Without accounting for this difference, pipelines and refineries appear with:
+
+```text
+Production = NULL
+```
+
+That could easily be interpreted as poor-producing assets rather than assets for which production data simply does not exist.
+
+The corrected analysis uses the asset ID prefix to identify asset class and restricts production-based comparisons to wells.
+
+Pipelines and refineries remain in the reliability analysis where production data is not required.
+
+---
+
+## 3. Failure Frequency Had No Time Context
+
+The original frequency analysis correctly counted failures.
+
+But it treated:
+
+```text
+6 failures in 6 years
+```
+
+and:
+
+```text
+6 failures in 6 months
+```
+
+as equivalent.
+
+The revised query adds:
+
+* First failure date
+* Last failure date
+* Observation span
+* Average interval between failures
+
+An asset with one failure has no failure interval, so the calculation explicitly handles that case instead of attempting to divide by zero.
+
+---
+
+## 4. Failure Types Were Ranked by Frequency Instead of Damage
+
+The original analysis answered:
+
+> Which failure happens most often?
+
+That is useful.
+
+It is not the same as:
+
+> Which failure causes the most operational disruption?
+
+The corrected version adds total downtime and ranks failure modes by damage.
+
+Frequency remains visible, but it no longer determines priority by itself.
+
+---
+
+## 5. Downtime Totals Hid Failure Behavior
+
+The original downtime ranking showed total hours.
+
+That does not distinguish:
+
+```text
+20 × 5-hour failures
+```
+
+from:
+
+```text
+1 × 100-hour failure
+```
+
+The corrected analysis adds:
+
+* Average downtime per failure
+* Maximum individual downtime
+* Failure frequency
+
+The output therefore provides both severity and recurrence.
+
+---
+
+# Step 7: Prioritize Downtime Where Production Is Highest
+
+Not every downtime hour has equal operational significance.
+
+Ten hours lost on a low-output well and ten hours lost on one of the fleet's highest-output wells create different exposure.
+
+The project uses quartile ranking to identify wells that are simultaneously:
+
+* In the highest downtime quartile
+* In the highest production quartile
+
+Conceptually:
+
+```text
+                     PRODUCTION
+                        HIGH
+                         |
+             +-----------+-----------+
+             |                       |
+             |   HIGH PRODUCTION     |
+             |    LOW DOWNTIME       |
+             |                       |
+LOW ---------+-----------------------+--------- HIGH
+DOWNTIME     |                       |        DOWNTIME
+             |                       |
+             |    LOW PRODUCTION     |   PRIORITY
+             |    HIGH DOWNTIME      |    WELLS
+             |                       |
+             +-----------+-----------+
+                         |
+                        LOW
+                     PRODUCTION
+```
+
+The top-right group is the priority.
+
+These wells combine substantial operational importance with poor reliability performance.
+
+That creates a defensible starting point for intervention.
+
+---
+
+# Step 8: Monitor Reliability Direction
+
+A single downtime total has limited context.
+
+Suppose the fleet lost 20,000 hours.
+
+Is that good?
+
+Bad?
+
+Normal?
+
+Without comparison, nobody knows.
+
+Trend changes the question.
+
+The project tracks by year:
+
+* Failure count
+* Total downtime
+* Change from prior year
+
+This allows management to ask:
+
+> **Is reliability getting better or worse?**
+
+rather than arguing about whether one isolated number looks high.
+
+---
+
+# Key Insights
+
+## Frequency and Downtime Identify Different Problems
+
+The asset failing most frequently is not necessarily the asset creating the most downtime.
+
+That means one reliability ranking is insufficient.
+
+Frequency highlights chronic recurrence.
+
+Downtime highlights operational disruption.
+
+Both matter.
+
+---
+
+## Failure Shape Is More Useful Than Failure Total
+
+Total downtime says how large the problem is.
+
+Average downtime per failure helps explain what kind of problem it is.
+
+```text
+Many short failures
+        |
+        v
+Recurring fault
+        |
+        v
+Root cause investigation
+```
+
+versus:
+
+```text
+Few long failures
+        |
+        v
+Major outage exposure
+        |
+        v
+Repair planning / spares review
+```
+
+That distinction changes the maintenance response.
+
+---
+
+## The Most Common Failure Is Not Necessarily the Most Damaging
+
+Occurrence count measures frequency.
+
+Total downtime measures disruption.
+
+Maintenance programs should not automatically target whichever failure appears most often.
+
+They should understand which failure modes consume the most operating availability.
+
+---
+
+## Reliability Problems Differ by Asset Class
+
+A fleet-wide failure average can hide asset-specific problems.
+
+Wells, pipelines, and refineries should therefore be analyzed separately before designing reliability interventions.
+
+---
+
+## High Downtime Becomes More Important on High-Production Assets
+
+Downtime alone tells you where operating availability is being lost.
+
+Production tells you where that availability matters most.
+
+Combining both provides a more useful prioritization signal than either metric independently.
+
+---
+
+## Reliability Direction Matters More Than an Isolated Total
+
+A large lifetime downtime number is difficult to interpret without context.
+
+A consistent year-over-year increase in downtime is much easier to act on.
+
+Trend turns reliability from an anecdotal maintenance discussion into a measurable operational trajectory.
+
+---
+
+# Recommendations
+
+## 1. Separate Chronic Failures From Major Outages
+
+Do not send both problems through the same maintenance response.
+
+Use failure frequency and average downtime together.
+
+### High frequency + low average downtime
+
+Prioritize root cause analysis.
+
+The issue is recurrence.
+
+### Low frequency + high average downtime
+
+Review:
+
+* Spare availability
+* Repair lead times
+* Maintenance planning
+* Failure response procedures
+
+The issue is outage severity.
+
+---
+
+## 2. Prioritize Failure Modes by Downtime Impact
+
+Use the failure-mode analysis to identify the categories responsible for the largest share of lost operating hours.
+
+Those failure modes are candidates for fleet-wide reliability programs.
+
+Fixing one recurring failure mechanism across many assets can produce more value than repeatedly repairing individual assets after failure.
+
+---
+
+## 3. Build Reliability Programs by Asset Class
+
+Do not apply one maintenance strategy uniformly across wells, pipelines, and refineries.
+
+Use the asset-class breakdown to identify dominant failure mechanisms within each equipment group.
+
+That allows targeted engineering programs instead of generic fleet-wide actions.
+
+---
+
+## 4. Start With High-Downtime, High-Production Wells
+
+The cross-ranking provides the strongest initial intervention list available from this dataset.
+
+These wells combine:
+
+* High operating importance
+* High downtime exposure
+
+Recovering one hour of availability on these assets has greater operational significance than recovering the same hour on a lower-output well.
+
+---
+
+## 5. Track Reliability Trend Regularly
+
+Failure frequency and downtime should be reviewed over time rather than treated as one-off portfolio statistics.
+
+The year-over-year analysis can become a recurring management KPI showing whether reliability interventions are actually improving fleet performance.
+
+---
+
+## 6. Improve Downtime Data Capture
+
+The current dataset records:
+
+* Failure date
+* Downtime duration
+
+but not exact outage start and end timestamps.
+
+That means the analysis cannot determine whether downtime occurred during:
+
+* Active production
+* Planned shutdown
+* Low-utilization periods
+
+Capturing outage timestamps would allow the next version of the system to distinguish:
+
+```text
+Downtime Hours
+```
+
+from:
+
+```text
+Production Hours Actually Lost
+```
+
+Those are not the same metric.
+
+---
+
+# Business Impact
+
+## Maintenance Effort Becomes More Targeted
+
+The system separates recurring failures from severe outages so each can be routed toward the appropriate intervention.
+
+---
+
+## Reliability Engineering Can Focus on Failure Modes, Not Just Assets
+
+Instead of repeatedly repairing individual equipment, the business can identify failure mechanisms responsible for substantial fleet-wide downtime and attack them systematically.
+
+---
+
+## High-Value Operating Time Gets Priority
+
+Combining production and downtime identifies wells where reliability improvements are most operationally significant.
+
+This gives maintenance teams a better starting point when capacity is limited.
+
+---
+
+## Downtime Becomes a Management Metric
+
+Maintenance spend answers:
+
+> How much did repairs cost?
+
+Downtime answers:
+
+> How much operating availability did failures remove?
+
+The project brings that second question into the reporting layer.
+
+---
+
+## Reliability Performance Becomes Measurable Over Time
+
+Year-over-year tracking allows management to determine whether maintenance strategy is improving fleet reliability or whether disruption continues to grow.
+
+---
+
+## Production Comparisons Become Trustworthy
+
+The corrected aggregate-then-join architecture removes the row multiplication that distorted the original production-versus-downtime analysis.
+
+The resulting comparison now reflects actual asset-level totals rather than artifacts created by SQL joins.
+
+---
+
+# What Was Built
+
+The completed analysis includes:
+
+* Failure Frequency Analysis
+* Failure Cadence Analysis
+* Downtime Exposure Analysis
+* Downtime Concentration Analysis
+* Failure Mode Severity Analysis
+* Asset-Class Failure Analysis
+* Production vs. Downtime Comparison
+* High-Production / High-Downtime Well Prioritization
+* Year-over-Year Reliability Monitoring
+
+The project also corrected:
+
+* Many-to-many join fan-out
+* Invalid production comparisons for non-well assets
+* Failure counts without time context
+* Frequency-only failure-mode ranking
+* Downtime reporting without severity context
+
+---
+
+# Tools & SQL Techniques
+
+### PostgreSQL 14
+
+Used for the complete reliability analysis.
+
+### Common Table Expressions
+
+Used to pre-aggregate maintenance and production independently before joining them.
+
+This eliminates row multiplication and makes the grain of each calculation explicit.
+
+### Window Functions
+
+Used for:
+
+* Percentage contribution
+* Cumulative downtime share
+* Asset-class percentages
+* Year-over-year comparison
+
+### `SUM() OVER()`
+
+Calculates each asset or failure mode's share of fleet-wide totals.
+
+### Running `SUM() OVER()`
+
+Builds cumulative downtime concentration.
+
+### `LAG()`
+
+Compares annual reliability performance with the previous year.
+
+### `NTILE(4)`
+
+Segments wells into production and downtime quartiles so different measurement scales can be compared without forcing them into arbitrary units.
+
+### PostgreSQL Date Arithmetic
+
+Measures elapsed days between the first and last recorded failure.
+
+### `CASE`
+
+Handles assets where a failure interval cannot be calculated because only one event exists.
+
+### `NULLIF()`
+
+Protects division calculations from zero denominators.
+
+### Explicit `NUMERIC` Casting
+
+Prevents integer division from discarding decimal precision.
+
+---
+
+# Results
+
+The SQL workflow produces eight operational outputs.
+
+| Output                           | Decision Supported                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------- |
+| Failure Frequency & Cadence      | Identifies repeat offenders and how quickly failures recur                               |
+| Downtime Severity                | Shows total, average, and worst-case outage exposure                                     |
+| Downtime Concentration           | Determines whether reliability exposure is concentrated enough for targeted intervention |
+| Failure Mode Impact              | Identifies fault categories responsible for the most operating disruption                |
+| Asset-Class Failure Analysis     | Shows how reliability problems differ across wells, pipelines, and refineries            |
+| Production & Downtime Comparison | Connects well reliability with production activity using corrected asset-level totals    |
+| High-Value Reliability Shortlist | Identifies wells combining high production with high downtime                            |
+| Reliability Trend                | Shows whether failures and downtime are improving or deteriorating over time             |
+
+The key output is not simply a list of assets that failed.
+
+It is a diagnostic path from:
+
+```text
+WHAT FAILED?
+      |
+      v
+HOW OFTEN?
+      |
+      v
+HOW LONG?
+      |
+      v
+WHY?
+      |
+      v
+WHERE IS THE DAMAGE CONCENTRATED?
+      |
+      v
+WHICH ASSETS MATTER MOST OPERATIONALLY?
+      |
+      v
+WHAT SHOULD MAINTENANCE ADDRESS FIRST?
+```
+
+That turns 3,000 maintenance events into a structured reliability decision process rather than another historical maintenance report.
+
+---
+
+# Data Limitations
+
+This project measures **observed reliability and downtime exposure**.
+
+It does not predict future equipment failures.
+
+Two limitations are particularly important.
+
+### Production coverage is limited to wells
+
+Pipelines and refineries remain part of the reliability analysis, but production-based prioritization applies only to wells.
+
+### Downtime is not timestamp-aligned with production
+
+The dataset records downtime duration and date but not exact outage start and end times.
+
+The analysis can therefore say:
+
+> This well accumulated 90 hours of downtime.
+
+It cannot claim:
+
+> This well lost exactly X barrels because of those 90 hours.
+
+Making that claim would require time-aligned production and outage data.
+
+With those fields, the system could be extended from **downtime exposure** toward **production-loss estimation and economic reliability prioritization**.
+
+---
+
+# Repository Structure
+
+```text
 02-failure-downtime-analysis/
 ├── README.md
 └── failure_downtime_analysis.sql
 ```
 
-### Running it
+---
+
+# Running the Project
+
+Requires PostgreSQL 12 or later. Developed against PostgreSQL 14.
 
 ```bash
 psql -d rigwatch -f sql/00_schema.sql
 psql -d rigwatch -f 02-failure-downtime-analysis/failure_downtime_analysis.sql
 ```
 
-Uncomment the `\copy` lines in the schema file first, and check the CSVs are in `data/`.
+Before running the schema, uncomment the required `\copy` statements and confirm the source CSV files are available in the repository's `data/` directory.
