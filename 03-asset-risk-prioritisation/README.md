@@ -1,309 +1,945 @@
-# Project 03: Asset Risk Scoring and Maintenance Prioritisation
+# Asset Risk Scoring & Maintenance Prioritization System
 
-**Out of three thousand assets, which ones does a maintenance team go and look at on Monday morning?**
-
-Script: [`asset_risk_prioritisation.sql`](asset_risk_prioritisation.sql)
-Database: PostgreSQL 14
-Setup required: run [`../sql/00_schema.sql`](../sql/00_schema.sql) first
+**A PostgreSQL reliability analytics system that ranks assets by operational risk and converts 3,000 maintenance records into a focused, capacity-aware maintenance worklist.**
 
 ---
 
-## 1. Business Problem
+## Business Problem
 
-Projects 01 and 02 each produced a ranked list. One ranked by money, one ranked by lost hours. Both are correct and neither is enough, because an asset can top one list and sit unremarkably in the middle of the other.
+Maintenance teams rarely have enough people, time, or budget to inspect every asset showing signs of trouble.
 
-That leaves a maintenance manager with three lists and no way to combine them. In practice what happens is that whichever list was presented most recently wins, or the assets that appear near the top of all three get picked by eye. Neither is a method, and neither survives being questioned.
+The real question is not:
 
-The problem this project solves is narrower and more practical than it sounds. A maintenance team has finite capacity. Someone has to decide which assets get inspected this week. That decision is currently made on judgement, experience and whoever shouted loudest, and it produces a different answer depending on who is asked.
+> Which assets have failed?
 
-What is needed is a single ordered list, short enough to act on, built from a rule that is written down. Written down matters as much as the ranking itself. A priority list nobody can explain gets overridden the first time an operations manager disagrees with it. A priority list with visible weights can be argued with, adjusted, and then actually followed.
+It is:
 
-The original script attempted exactly this in its final query. The intent was right. The execution had problems serious enough that the output would have sent the team to the wrong assets, and section 4 covers them in detail.
+> **Which assets should the maintenance team inspect first, and why?**
 
-## 2. Data Source
+That distinction matters.
 
-All three tables, joined into a single asset level view.
+An asset can fail frequently without causing much downtime. Another can fail only a few times but shut operations down for hundreds of hours. A third may not lead either list but consistently combine high maintenance cost, repeated failures, and significant downtime.
 
-**`maintenance.csv`**, 3,000 events. Failure history: asset, date, cost, failure type, downtime hours.
+Looking at those metrics separately produces different priority lists.
 
-**`production.csv`**, 5,000 readings. Well level output: oil barrels, gas volume, water cut, pressure, temperature. Wells only.
+That creates an operational problem:
 
-**`emissions.csv`**, 3,000 readings. Environmental performance by asset: CO2 tons, methane leakage, energy consumption. Covers wells, pipelines and refineries, so it is the only one of the three that lines up with the full range of asset IDs in maintenance.
-
-The three are combined in `v_asset_reliability`, which produces one row per asset with failure history, production totals and emissions averages side by side.
-
-**Three limits that shape how the output should be read.**
-
-Production covers wells only. Pipelines and refineries carry NULL in those columns. That is expected and is labelled rather than hidden.
-
-There is no date alignment between the three tables. A 2018 failure and a 2024 production reading belong to the same asset and to completely different moments. The view reports lifetime totals and names them as such. It does not claim that the production figure next to a failure is the production around that failure, because the data cannot support that claim.
-
-The maintenance CSV has no unique event identifier. Without one there is no safe way to count distinct failures once the table is joined to anything. The schema adds a surrogate primary key, and that single change is what makes the corrected version of this analysis possible at all.
-
-## 3. Methodology
-
-**Fix the foundation first.** The view everything else reads from was producing duplicated rows. Rebuilding it correctly came before any scoring, because scoring built on inflated inputs would be precisely wrong. Details in section 4.
-
-**Put the three tables on a common grain.** Each source is aggregated to one row per asset before anything is joined. The result is a view where one row means one asset, which is what every downstream query already assumed it meant.
-
-**Check the emissions relationship, and be careful about what it shows.** The question is whether assets that emit heavily also fail often. Reported two ways: asset level detail, and a quartile summary. The quartile summary is the more honest of the two, because if the two rankings were unrelated the average failure count would sit roughly flat across all four bands. A visible gradient means something. A flat line means the relationship is not there, and that is a legitimate finding worth reporting rather than burying.
-
-**Flag the assets that are bad on two dimensions at once.** Assets in the top 10 percent for both failure count and downtime. Thresholds come from percentiles rather than from picked numbers, which is a deliberate choice covered below.
-
-**Score every asset instead of filtering.** A pass or fail flag throws away the ordering inside the group that passes. Percentile ranking each asset on downtime, frequency and cost, then combining with weights, gives a single continuous score with everything still in order.
-
-**Check the list is a workable size.** Before handing anyone a priority list, count it. If the top band contains four hundred assets, the banding has failed no matter how sound the scoring is, because nobody inspects four hundred assets. This check comes before the final output rather than after.
-
-**Reduce to something printable.** The last query returns only the top band and only the columns a planner needs. A report that needs interpretation before anyone can act on it does not get acted on.
-
-### Why percentiles instead of fixed thresholds
-
-This is the main methodological choice in the project, so it is worth being explicit.
-
-The original used hardcoded numbers: more than 5 failures, more than 100 hours, more than 3 failures. Fixed thresholds have two failure modes. Nobody can explain where the number came from, so it gets challenged and cannot be defended. And it goes stale silently. A threshold set when the fleet averaged 2 failures per asset means something entirely different once the fleet averages 6, and nothing in the code announces that it has stopped working.
-
-A percentile threshold describes a position in the fleet. The top 10 percent is the top 10 percent whatever happens to the underlying numbers, it is defensible in a meeting because it means something in plain English, and it stays correct when the data refreshes.
-
-The trade off is real and worth stating. Percentile thresholds always return roughly the same number of assets, so if the whole fleet improves, the same proportion still gets flagged. For a work prioritisation list that is the right behaviour, because the team's capacity has not changed either. For a safety threshold it would be the wrong behaviour, and an absolute limit would be correct there.
-
-## 4. Analysis and Error Check
-
-This project inherited the two worst problems in the original script. Both are set out in full because the reasoning matters more than the fix.
-
-### The view was multiplying rows
-
-The original:
-
-```sql
-CREATE VIEW v_asset_reliability AS
-SELECT m.asset_id, m.maintenance_date, m.cost_usd, m.failure_type,
-       m.downtime_hours, p.well_id, p.oil_production_barrels, p.date,
-       e.co2_tons, e.methane_leakage_tons, e.energy_consumption_mwh
-FROM maintenance m
-LEFT JOIN production p ON m.asset_id = p.well_id
-LEFT JOIN emissions  e ON m.asset_id = e.asset_id;
+```text
+Highest Maintenance Cost
+          |
+Highest Failure Frequency
+          |
+Highest Downtime
+          |
+          v
+   THREE DIFFERENT
+    PRIORITY LISTS
+          |
+          v
+   Which one does the
+   maintenance team use?
 ```
 
-None of the three tables has one row per asset. `maintenance` holds many events per asset, `production` holds many readings per well, `emissions` holds many readings per asset. Joining all three at row level returns every combination of the three.
+This project solves that problem by combining three dimensions of asset reliability:
 
-An asset with 4 maintenance events, 3 production readings and 2 emissions readings comes out as 24 rows. It should be 4. Every aggregate taken off this view is wrong, and the multiplier is different for every asset.
+* Downtime exposure
+* Failure frequency
+* Maintenance cost
 
-The second problem is the missing date condition. Nothing constrains a maintenance event to be joined to a production reading from anywhere near the same period. A 2018 failure joins to a 2024 reading. Even with the duplication removed, the production figure sitting next to a failure is lifetime production, not production around the failure.
+into a single **0 to 100 Asset Risk Score**.
 
-The third problem is the one that would have caught out any future reader. The view's column list looks like an asset summary. Anyone would reasonably assume one row per asset. It is in fact an event level join wearing an asset level name, and nothing in the code says so.
+The output is not another maintenance dashboard.
 
-**Fixed** by aggregating each source to one row per asset in a CTE and then joining the three summaries. The view now genuinely has the grain its name implies. Lifetime totals are labelled as lifetime totals rather than implying a link the data cannot support.
-
-### The emissions query counted the wrong thing entirely
-
-The original:
-
-```sql
-SELECT asset_id, AVG(co2_tons) AS avg_emissions, COUNT(*) AS failures
-FROM v_asset_reliability
-GROUP BY asset_id
-ORDER BY avg_emissions DESC;
-```
-
-Because the view had already multiplied every asset's rows, `COUNT(*)` was not a failure count. It was maintenance events multiplied by production readings multiplied by emissions readings. The column was labelled `failures` and contained a number with no operational meaning at all.
-
-`AVG(co2_tons)` had the same problem in a subtler form. Averaging over duplicated rows weights each asset by how many maintenance and production rows it happens to have. Assets that failed more often pulled the emissions average around for reasons that had nothing to do with emissions. This one is nastier than the count, because the result still looks like a plausible average.
-
-**Fixed** by reading from the rebuilt view, where one row is one asset. The count is now a real failure count and the average is a real average. I also added a quartile summary, because the asset level list makes a relationship easy to imagine and hard to verify, and added a note in the script that co-occurrence is not causation. Both are more likely driven by how hard the asset is worked.
-
-### Documentation and code disagreed in the priority query
-
-The comment block above the original query 9 said:
-
-> Immediate Maintenance Required: Assets with more than eight recorded maintenance events.
-> High Risk: Assets with more than 120 hours of accumulated downtime.
-> Stable: Assets currently below the defined intervention thresholds.
-
-The code underneath said:
-
-```sql
-CASE
-    WHEN COUNT(*) > 3 THEN 'Immediate Maintenance Required'
-    WHEN SUM(downtime_hours) > 100 THEN 'High Risk'
-        WHEN SUM(downtime_hours) > 50 THEN 'Medium Risk'
-    ELSE 'Low Risk'
-END
-```
-
-Three disagreements. Eight events in the comment against 3 in the code. 120 hours against 100. Three named tiers in the comment against four in the code, with a Medium Risk tier that the documentation never mentions.
-
-This is worse than either being wrong on its own, because a reader has no way to tell which one was intended. It is also the kind of thing a technical reviewer spots in the first minute, and once found it puts every other number in the file in doubt.
-
-The indentation on the third `WHEN` is misaligned as well. Cosmetic, but in a portfolio piece it reads as carelessness in a query that is already contradicting itself.
-
-### The CASE ladder made one dimension override the other
-
-Bigger than the threshold mismatch, and easier to miss.
-
-Because `COUNT(*) > 3` is evaluated first, an asset with 4 failures and 20 hours of downtime is labelled Immediate Maintenance Required. An asset with 3 failures and 600 hours of downtime fails that first test and falls through to High Risk.
-
-The second asset has lost thirty times more operating time. The ladder ranks it lower. That is not a threshold that needs tuning, it is the wrong structure for the question: a sequential CASE cannot combine two dimensions, it can only let the first one it checks win.
-
-**Fixed** by replacing the ladder with a weighted score. Each asset is percentile ranked on downtime, failure frequency and cost, and the three are combined:
-
-| Dimension | Weight | Reasoning |
-|---|---|---|
-| Downtime | 50% | Lost hours are lost production. Closest proxy for money the data offers |
-| Frequency | 30% | Repeat failures signal an unsolved root cause, which is what maintenance can actually fix |
-| Cost | 20% | Real, but partly a consequence of the other two, so the smallest share |
-
-The weights are visible in the code and stated here. Change them and the ranking changes, which is the point. The final output also breaks out each dimension's contribution to the score, so anyone can see why a given asset ranked where it did.
-
-### Two definitions of risky in one file
-
-The original query 7 used more than 5 failures and more than 100 hours. Query 9 used more than 3 failures for what was effectively the same question. Two thresholds for one concept in a single script.
-
-**Fixed** by deriving both from the same percentile logic, so the two queries agree by construction rather than by someone remembering to keep them in step.
-
-### No way to count distinct failures
-
-The maintenance CSV has no event identifier. Once joined to anything, `COUNT(*)` counts join output rows rather than events, and there is no `COUNT(DISTINCT ...)` available to fall back on.
-
-**Fixed** by adding `maintenance_id BIGSERIAL PRIMARY KEY` in the schema. Small change, and it is what makes a correct failure count possible after a join.
-
-### `CREATE VIEW` rather than `CREATE OR REPLACE VIEW`
-
-The script fails on the second run. Anyone reviewing the work will run it more than once.
-
-**Fixed.**
-
-## 5. Insight
-
-**The single most important finding is that the previous risk list was not a risk list.** The view feeding it was duplicating rows, the failure count in the emissions query was a join artefact, and the priority CASE ranked an asset with 20 lost hours above one with 600. A maintenance team following that output would have been sent to the wrong assets while genuinely failing equipment stayed on the Monitor line. That has to be said first, because everything else is an improvement on top of a foundation that was not sound.
-
-**No single dimension identifies the assets that matter.** Cost, frequency and downtime each produce a different ranking, and the assets that matter most are the ones that appear in the upper reaches of all three without necessarily topping any of them. Those assets are invisible to every single dimension list, which is why three separate reports do not add up to a priority list.
-
-**A pass or fail flag throws away most of the information.** Query 3.3 tells you which assets clear both thresholds. It cannot tell you which of them to do first, and it cannot distinguish an asset that just cleared the line from one far beyond it. The continuous score in 3.4 keeps that ordering, which is what makes it usable when capacity runs out halfway down the list.
-
-**Showing the score's components is what makes it trustworthy.** The final output breaks out the downtime, frequency and cost contributions separately. An asset scoring 96 because it never stops failing needs a different response from one scoring 96 because of a single catastrophic outage. A bare score hides that, and hidden scores get ignored the first time someone disagrees with one.
-
-**The emissions and failure relationship should be reported honestly, whichever way it comes out.** Query 3.2 tests whether high emitting assets also fail more often. A visible gradient across the quartiles means something worth investigating. A flat line means the relationship is not there, and that is a real finding. What matters either way is that co-occurrence is not causation, and both are plausibly driven by how hard the asset is worked. Overstating this would be the easiest mistake in the whole project.
-
-**A prioritisation method is only as good as the size of the list it produces.** Query 3.5 exists because a perfectly scored top band of four hundred assets is not a priority list, it is the same problem restated. Checking the band sizes is part of the method, not a footnote to it.
-
-## 6. Recommendation
-
-**Adopt the weighted score from query 3.4 as the standing prioritisation method, and publish the weights.** The weights matter less than the fact that they are visible. A rule everyone can see gets followed and improved. A rule nobody can explain gets overridden.
-
-**Work the Inspect Now band from query 3.6 first, and read the contribution columns before assigning anyone.** High downtime contribution means engineering. High frequency contribution means root cause. High cost contribution with low downtime usually means an asset nearing the end of its economic life, which is a replacement decision rather than a maintenance one.
-
-**Check the band sizes in query 3.5 against actual team capacity and tune the cut offs until the top band is about a week of work.** The 95 and 85 boundaries in the script are starting points, not findings. They should be set by how many assets a team can realistically visit.
-
-**Revisit any decision made from the earlier risk output.** The previous ranking was built on a view that duplicated rows and a CASE that inverted the ordering. Assets deprioritised under it may have been the wrong ones. This is not a comfortable recommendation and it is the correct one.
-
-**Report the emissions and failure comparison as an observation, not a conclusion.** If the gradient in query 3.2 is real, it is worth investigating whether asset utilisation drives both. It is not evidence that emissions cause failures, and presenting it that way would be indefensible the first time someone asked.
-
-**Add a start time to the downtime records.** Right now there is a date and a duration but no time of day. Without it, nobody can say whether an outage hit during production or during a planned shutdown. That distinction would let the downtime weight be replaced by actual barrels lost, which would make the whole score materially better.
-
-**Re-run the scoring monthly.** Percentile based scoring re-ranks automatically as the data refreshes, so this needs no maintenance beyond scheduling it.
-
-## 7. Business Impact
-
-**The maintenance team gets one list instead of three.** Capacity goes to the assets carrying the most combined risk rather than to whichever report was circulated most recently. Same resources, better placed.
-
-**The list can be defended.** Visible weights and per dimension contributions mean the ranking survives being questioned. That is the difference between a method that gets adopted and one that gets quietly ignored.
-
-**Prioritisation stops inverting.** The old CASE could rank an asset with 20 lost hours above one with 600. Correcting it changes which assets get attention, and this is the change with the largest operational consequence in the project.
-
-**Downstream numbers become correct.** The rebuilt view feeds every query here. With the duplication removed, the failure counts, cost totals and emissions averages are real numbers rather than join artefacts.
-
-**Work sizing becomes part of the output.** Query 3.5 shows how many assets each band contains and how much of total downtime each band covers. That turns the analysis into something a supervisor can resource against.
-
-**The method survives the data changing.** Percentile thresholds re-rank as the fleet changes. Fixed thresholds go stale without announcing it, which is the failure mode that quietly retires most internal reports.
-
-## 8. What Was Done
-
-Rebuilt `v_asset_reliability` from scratch. Aggregated all three source tables to one row per asset before joining, so the view now has the grain its name implies and its aggregates are correct.
-
-Documented the three separate problems in the original view: the row multiplication across three tables, the absence of any date condition, and the mismatch between the view's apparent grain and its actual one.
-
-Corrected the emissions query, which had been reporting a join artefact under the column name `failures`, and added a quartile summary so the relationship can be assessed rather than assumed.
-
-Found and documented the contradiction between the priority query's comments and its code: eight events against three, 120 hours against 100, three tiers against four.
-
-Replaced the sequential CASE ladder with a weighted percentile score, after establishing that the ladder let failure count override downtime entirely and could rank a 20 hour asset above a 600 hour one.
-
-Set the weights explicitly, documented the reasoning for each, and broke out every dimension's contribution in the final output so the ranking can be interrogated.
-
-Replaced both hardcoded threshold sets with percentile logic, so the two risk queries agree by construction, and wrote down the trade off that choice involves.
-
-Added a band sizing query so the priority list can be checked against real team capacity before anyone is assigned to it.
-
-Added a final output containing only the top band and only the columns a planner needs.
-
-Added a surrogate primary key to the maintenance table in the schema, which is what makes counting distinct failures after a join possible.
-
-## 9. Tools Used and How They Helped
-
-**PostgreSQL 14.** `PERCENT_RANK`, `PERCENTILE_CONT`, `NTILE` and `MODE() WITHIN GROUP` are all standard here. The whole scoring model stays in SQL with no export step, so there is no second version of the numbers that can drift from the source.
-
-**Common table expressions inside a view.** The fix for the fan-out. Aggregating each source before joining is the correction, and doing it in CTEs inside the view definition means every downstream query inherits the fix automatically rather than having to remember it.
-
-**`PERCENT_RANK()`.** The core of the scoring. It converts each metric to a 0 to 1 position within the fleet, which is what lets dollars, hours and event counts be combined without inventing exchange rates between them. Chosen over `NTILE` here because it is continuous, so the ordering inside each band is preserved.
-
-**`PERCENTILE_CONT()`.** Derives the top 10 percent thresholds in query 3.3 from the data. This is the replacement for the hardcoded numbers, and it is what lets the threshold be stated in English as "the worst 10 percent of the fleet".
-
-**`NTILE(4)`.** Used for the emissions bands, where four readable groups are more useful than a continuous rank. Different job from `PERCENT_RANK`, which is why both appear.
-
-**`MODE() WITHIN GROUP (ORDER BY failure_type)`.** Returns each asset's most common failure type in the view. Doing this with `GROUP BY` and a row number would take an entire extra CTE.
-
-**`CROSS JOIN` against a single row CTE.** Query 3.3 computes both percentile thresholds once and cross joins them onto every row. A correlated subquery would recompute them per row, and putting them in the output makes the thresholds visible to whoever reads the results.
-
-**`CREATE OR REPLACE VIEW`.** The script now re-runs cleanly.
-
-**`BIGSERIAL PRIMARY KEY`.** Added to maintenance in the schema. Enables an accurate event count after any join, which the source data made impossible.
-
-**`NULLIF()` and `NULLS LAST`.** Guard the divisions and keep assets with no emissions data from sorting to the top of query 3.2.
-
-## 10. Results
-
-Six outputs, moving from foundation to action list.
-
-| Query | What it gives you |
-|---|---|
-| 3.1 | `v_asset_reliability`, rebuilt. One row per asset, correct aggregates, all three tables |
-| 3.2 | Emissions against failure activity, at asset level and summarised into quartile bands |
-| 3.3 | Assets in the top 10 percent for both failure count and downtime, with the thresholds shown |
-| 3.4 | Every asset scored 0 to 100, banded into four actions, with each dimension's contribution |
-| 3.5 | How many assets fall in each action band and how much downtime each band covers |
-| 3.6 | The Monday morning list: top band only, planner columns only |
-
-The concrete outcomes.
-
-The view now returns one row per asset. Everything reading from it produces real numbers instead of join artefacts, which is the fix the rest of the project depends on.
-
-Query 3.2 reports a real failure count where the original reported a meaningless product of three row counts, and it reports the relationship at group level where it can actually be assessed.
-
-Query 3.4 replaces a CASE ladder that could rank a 20 hour asset above a 600 hour one with a score that weighs all three dimensions and shows its working.
-
-Query 3.5 makes the output resourceable, by answering how much work the recommendation actually implies.
-
-Query 3.6 reduces three thousand assets to a list short enough to print and specific enough to act on.
-
-The percentile approach means all of this re-ranks correctly when the data refreshes, with no thresholds to maintain.
-
-Every result is reproducible from the schema file and the three source CSVs.
+It is an ordered work queue showing **which assets require attention first, what is driving their risk, and how much work each priority band creates for the maintenance team.**
 
 ---
 
-### Files
+# Business Value
 
+The system turns maintenance data into a resource-allocation decision.
+
+Instead of giving a maintenance manager three separate reports and expecting them to reconcile the results manually, the project creates one workflow:
+
+```text
+MAINTENANCE HISTORY
+        |
+        v
+FAILURE FREQUENCY
+        |
+        +-------------------+
+                            |
+DOWNTIME ------------------+
+                            |
+MAINTENANCE COST ----------+
+                            |
+                            v
+                    ASSET RISK SCORE
+                         0 - 100
+                            |
+             +--------------+--------------+
+             |              |              |
+             v              v              v
+         INSPECT         SCHEDULE        MONITOR
+           NOW           MAINTENANCE
+             |
+             v
+      WEEKLY WORKLIST
 ```
+
+This gives maintenance planners a consistent method for deciding where limited engineering capacity should go first.
+
+---
+
+# What the System Answers
+
+The analysis is built around six operational questions.
+
+### 1. Which assets fail most often?
+
+Identify equipment with recurring maintenance events that may indicate unresolved reliability problems.
+
+### 2. Which assets create the most downtime?
+
+Separate frequent minor problems from failures that materially affect operating availability.
+
+### 3. Which assets consume the most maintenance spend?
+
+Identify equipment absorbing disproportionate maintenance resources.
+
+### 4. Which assets are severe across multiple dimensions?
+
+Find assets sitting near the top of both failure frequency and downtime rather than relying on one metric alone.
+
+### 5. What should the maintenance team prioritize?
+
+Combine downtime, frequency, and cost into a single ranked Asset Risk Score.
+
+### 6. Is the resulting workload realistic?
+
+Measure how many assets fall into each priority band before handing the list to operations.
+
+That final question is important.
+
+A model that labels 400 assets as urgent has not prioritized anything.
+
+---
+
+# Data
+
+The project uses three operational datasets.
+
+| Dataset           | Records | Business Role                                        |
+| ----------------- | ------: | ---------------------------------------------------- |
+| `maintenance.csv` |   3,000 | Maintenance events, failure type, cost, and downtime |
+| `production.csv`  |   5,000 | Well production and operating readings               |
+| `emissions.csv`   |   3,000 | CO2, methane leakage, and energy consumption         |
+
+These sources are combined into an asset-level reliability model.
+
+---
+
+## Maintenance Data
+
+Contains:
+
+* Asset ID
+* Maintenance date
+* Failure type
+* Maintenance cost
+* Downtime hours
+
+This is the primary source for reliability scoring.
+
+---
+
+## Production Data
+
+Contains well-level operational readings including:
+
+* Oil production
+* Gas production
+* Water cut
+* Pressure
+* Temperature
+
+Production data covers **wells only**.
+
+Pipelines and refineries therefore carry `NULL` production values by design.
+
+They are not interpreted as zero-production assets.
+
+---
+
+## Emissions Data
+
+Contains:
+
+* CO2 emissions
+* Methane leakage
+* Energy consumption
+
+Unlike production, emissions data covers wells, pipelines, and refineries.
+
+This allows environmental performance to be compared against reliability patterns across the broader asset base.
+
+---
+
+# Analytical Architecture
+
+A central requirement of the project was ensuring that:
+
+> **One row in the reliability layer represents one asset.**
+
+Each source is therefore aggregated independently before the datasets are joined.
+
+```text
+MAINTENANCE
+    |
+    v
+Aggregate by Asset
+    |
+    +------------------+
+                       |
+PRODUCTION             |
+    |                  |
+    v                  |
+Aggregate by Asset ----+----> v_asset_reliability
+                       |             |
+EMISSIONS              |             |
+    |                  |             v
+    v                  |       Reliability Analysis
+Aggregate by Asset ----+             |
+                                     v
+                              Percentile Scoring
+                                     |
+                                     v
+                              Priority Bands
+                                     |
+                                     v
+                              Maintenance Worklist
+```
+
+This architecture prevents one-to-many joins from multiplying asset records and corrupting downstream metrics.
+
+---
+
+# Methodology
+
+## Step 1: Build a Reliable Asset-Level Foundation
+
+Maintenance, production, and emissions all contain multiple records per asset.
+
+Joining them directly would create combinations of those records rather than one clean asset summary.
+
+The project therefore aggregates each dataset to asset level first and only then joins them into:
+
+`v_asset_reliability`
+
+The resulting view contains one row per asset with:
+
+* Failure count
+* Total downtime
+* Maintenance cost
+* Most common failure type
+* Production metrics where applicable
+* Emissions metrics
+
+Every downstream analysis inherits the same grain.
+
+---
+
+## Step 2: Examine Failure and Emissions Behavior
+
+The project tests whether higher-emitting assets also show higher failure activity.
+
+Rather than relying only on individual asset rows, assets are grouped into emissions quartiles.
+
+That makes it easier to ask:
+
+> Do failure levels materially change as emissions increase?
+
+If failure activity rises across the quartiles, there is a relationship worth investigating.
+
+If the pattern remains flat, the data does not support that relationship.
+
+Either result is useful.
+
+The analysis deliberately does **not** claim that emissions cause failures.
+
+Both may instead be influenced by another factor such as asset utilization.
+
+---
+
+## Step 3: Identify Multi-Dimensional Reliability Risk
+
+The next layer isolates assets in the **top 10% of the fleet for both failure frequency and downtime**.
+
+This identifies equipment that is not simply problematic on one dimension.
+
+It is problematic on both.
+
+Thresholds are derived using fleet percentiles rather than arbitrary fixed numbers.
+
+---
+
+# Why Percentiles Instead of Fixed Thresholds?
+
+A rule such as:
+
+```text
+More than 5 failures = High Risk
+```
+
+looks simple, but it creates two problems.
+
+First, someone eventually asks:
+
+> Why five?
+
+If the number has no operational basis, the rule is difficult to defend.
+
+Second, the threshold becomes stale as fleet behavior changes.
+
+If average failure frequency rises from two events to six, a five-failure threshold no longer represents exceptional performance.
+
+Percentiles answer a different question:
+
+> **Where does this asset sit relative to the rest of the fleet?**
+
+For example:
+
+```text
+Top 10% Failure Frequency
++
+Top 10% Downtime
+=
+Severe Relative Reliability Exposure
+```
+
+As fleet performance changes, the ranking recalculates automatically.
+
+### Trade-Off
+
+Percentiles are appropriate here because this is a **work prioritization system**.
+
+They would not be appropriate for a hard safety limit.
+
+If equipment must never exceed a defined pressure, temperature, or regulatory threshold, that limit should remain absolute regardless of how the rest of the fleet performs.
+
+---
+
+# Asset Risk Score
+
+Filtering assets into risky and not risky still leaves one problem:
+
+**Which risky asset comes first?**
+
+The project therefore scores every asset continuously.
+
+Three dimensions contribute to the final score:
+
+| Risk Dimension    | Weight | Business Reason                                                  |
+| ----------------- | -----: | ---------------------------------------------------------------- |
+| Downtime          |    50% | Closest available measure of lost operational availability       |
+| Failure Frequency |    30% | Repeated failures indicate unresolved reliability problems       |
+| Maintenance Cost  |    20% | Measures financial resources already being consumed by the asset |
+
+Each metric is percentile-ranked from 0 to 1 before weighting.
+
+Conceptually:
+
+```text
+Asset Risk Score =
+    Downtime Rank × 50%
+  + Failure Rank  × 30%
+  + Cost Rank     × 20%
+```
+
+The result is converted to a **0 to 100 score**.
+
+---
+
+# Why Normalize Before Combining?
+
+Downtime is measured in hours.
+
+Maintenance spend is measured in dollars.
+
+Failure frequency is measured in events.
+
+Adding the raw numbers together would be meaningless.
+
+For example:
+
+```text
+400 downtime hours
++ $30,000 maintenance cost
++ 12 failures
+```
+
+does not produce a meaningful risk value.
+
+Percentile ranking converts each metric into its **relative position within the fleet** before they are combined.
+
+This allows different units to contribute to one score without pretending an hour of downtime is mathematically equivalent to a dollar of maintenance spend.
+
+---
+
+# Explainable Prioritization
+
+The final output does not return only a risk score.
+
+It also shows how each dimension contributed to that score.
+
+That matters operationally.
+
+Two assets can both score 92 while representing completely different maintenance problems.
+
+```text
+ASSET A
+Risk Score: 92
+
+Downtime Contribution: High
+Failure Contribution: Moderate
+Cost Contribution: Moderate
+
+Likely issue:
+Large operational disruption
+```
+
+versus:
+
+```text
+ASSET B
+Risk Score: 92
+
+Downtime Contribution: Moderate
+Failure Contribution: High
+Cost Contribution: High
+
+Likely issue:
+Repeated expensive maintenance
+```
+
+The same score can therefore lead to different interventions.
+
+The score prioritizes the asset.
+
+The component metrics help explain **why it was prioritized**.
+
+---
+
+# Maintenance Priority Bands
+
+The continuous risk score is converted into action-oriented maintenance bands.
+
+Conceptually:
+
+```text
+0 -------------------------------------------- 100
+
+LOWER RISK                            HIGHER RISK
+
+Monitor     Planned Work     Schedule     Inspect Now
+```
+
+The highest band becomes the maintenance team's immediate worklist.
+
+The exact band boundaries are treated as operating parameters rather than universal truths.
+
+They should be calibrated against actual maintenance capacity.
+
+---
+
+# Capacity-Aware Prioritization
+
+A technically correct priority model can still fail operationally.
+
+If the system produces:
+
+> 437 assets requiring immediate inspection
+
+but the maintenance team can inspect 25 assets per week, the output is not actionable.
+
+The project therefore measures:
+
+* Number of assets per priority band
+* Share of total downtime represented by each band
+* Size of the highest-priority work queue
+
+This allows management to align the model with actual field capacity.
+
+The target is not:
+
+> **Find every risky asset.**
+
+The target is:
+
+> **Identify the highest-value maintenance work that available capacity can realistically execute.**
+
+---
+
+# SQL Review & Model Corrections
+
+Before building the final scoring model, the original SQL was reviewed against the structure of the source data.
+
+Several issues materially affected the original ranking.
+
+---
+
+## 1. Three-Way Join Fan-Out
+
+The original reliability view joined maintenance, production, and emissions directly at row level.
+
+All three contain multiple observations per asset.
+
+That creates multiplication.
+
+For an asset with:
+
+```text
+4 maintenance events
+3 production readings
+2 emissions readings
+```
+
+a direct join can produce:
+
+```text
+4 × 3 × 2 = 24 rows
+```
+
+Those 24 rows do not represent 24 real events.
+
+They are combinations created by the join.
+
+Any downstream:
+
+* `COUNT()`
+* `SUM()`
+* `AVG()`
+
+can therefore become distorted.
+
+### Correction
+
+Each dataset is aggregated to one row per asset **before** joining.
+
+The reliability view now has the grain its name implies:
+
+> **One asset = one row**
+
+---
+
+## 2. Failure Count Was Measuring Join Output
+
+The original emissions analysis used:
+
+`COUNT(*) AS failures`
+
+against the multiplied reliability view.
+
+That did not count failures.
+
+It counted rows produced by the join.
+
+A metric labelled `failures` therefore contained an operationally meaningless number.
+
+The rebuilt asset-level view corrects the issue at the source.
+
+---
+
+## 3. Documentation and Scoring Logic Disagreed
+
+The original documentation described one set of thresholds while the SQL implemented another.
+
+Examples included:
+
+* More than 8 events in the documentation vs. more than 3 in the SQL
+* More than 120 downtime hours vs. more than 100
+* Three documented risk tiers vs. four implemented tiers
+
+For a prioritization system, this creates a governance problem.
+
+If the maintenance manager cannot determine which rule is authoritative, the ranking cannot be trusted.
+
+The replacement scoring method removes the conflicting threshold definitions.
+
+---
+
+## 4. Sequential Risk Rules Could Invert Priority
+
+The original risk classification evaluated failure count before downtime.
+
+That meant an asset with:
+
+```text
+4 failures
+20 downtime hours
+```
+
+could receive a higher priority than one with:
+
+```text
+3 failures
+600 downtime hours
+```
+
+because the first asset triggered the first `CASE` condition.
+
+The second asset lost **30 times more operating time** but could still receive the lower classification.
+
+That is not a threshold problem.
+
+It is a scoring-architecture problem.
+
+### Correction
+
+The sequential rule was replaced with a weighted score that evaluates all three dimensions simultaneously.
+
+---
+
+## 5. Multiple Definitions of "Risky"
+
+Different sections of the original analysis used different failure thresholds for effectively the same concept.
+
+The corrected model derives risk positions from a shared percentile framework so the definitions remain consistent across queries.
+
+---
+
+## 6. Maintenance Events Had No Unique Identifier
+
+The original maintenance source did not provide a unique event ID.
+
+Once maintenance records are joined to another one-to-many table, `COUNT(*)` can no longer safely represent the number of real maintenance events.
+
+The schema adds:
+
+`maintenance_id BIGSERIAL PRIMARY KEY`
+
+This creates an identifiable maintenance-event grain and makes event counting reliable after joins.
+
+---
+
+# Key Insights
+
+## One Metric Is Not Enough
+
+Maintenance cost, downtime, and failure frequency identify different assets.
+
+An asset does not need to rank first on any one measure to be one of the fleet's biggest reliability problems.
+
+The highest-priority equipment is often the equipment that performs badly across several dimensions simultaneously.
+
+That is why the combined score is more useful than three independent rankings.
+
+---
+
+## Downtime Deserves the Largest Weight
+
+Failure count tells you how often something breaks.
+
+Maintenance cost tells you how expensive it has been to maintain.
+
+Downtime tells you how much operational availability has already been lost.
+
+With the available data, downtime is therefore the closest proxy for business interruption.
+
+That is why it receives 50% of the score.
+
+---
+
+## Repeated Failures Point Toward Root Cause Problems
+
+An asset repeatedly returning to maintenance may indicate that previous work treated symptoms rather than the underlying failure mechanism.
+
+A high frequency contribution should therefore trigger more than another routine repair.
+
+It should trigger root cause investigation.
+
+---
+
+## High Cost Does Not Always Mean Repair
+
+An asset with high maintenance spend but comparatively modest downtime and frequency may present a different question:
+
+> **Is this equipment still economically worth maintaining?**
+
+That turns a maintenance problem into a repair-versus-replacement decision.
+
+---
+
+## Explainability Matters
+
+A score nobody can explain is difficult to use operationally.
+
+Showing the contribution of downtime, failure frequency, and cost allows engineers and planners to challenge the ranking with evidence rather than intuition.
+
+That makes the model adjustable without making it arbitrary.
+
+---
+
+# Recommendations
+
+## 1. Use the Risk Score as the Weekly Maintenance Queue
+
+Recalculate the ranking on a regular schedule and use the highest-priority band as the starting point for maintenance planning.
+
+---
+
+## 2. Match Intervention to the Risk Driver
+
+Do not treat every high-risk asset the same.
+
+### Downtime-driven risk
+
+Prioritize reliability engineering and operational availability.
+
+### Frequency-driven risk
+
+Perform root cause analysis and investigate recurring failure modes.
+
+### Cost-driven risk
+
+Review repair economics, maintenance strategy, and possible replacement.
+
+### High across all dimensions
+
+Escalate for immediate reliability review.
+
+---
+
+## 3. Set Priority Bands From Real Team Capacity
+
+If the team can inspect 20 assets per week, the highest-priority band should produce something close to a workable queue.
+
+The score ranks risk.
+
+Operational capacity determines where the action boundary should sit.
+
+---
+
+## 4. Reassess Decisions Made From the Previous Ranking
+
+Because the earlier model contained row multiplication and sequential scoring problems, previous priority decisions based on that output should be reconsidered.
+
+The corrected model can materially change which assets appear at the top.
+
+---
+
+## 5. Improve Downtime Capture
+
+The current data records downtime duration and date but not the exact start time.
+
+That prevents the analysis from distinguishing between:
+
+* Downtime during active production
+* Planned shutdown periods
+* Low-utilization periods
+
+Capturing outage start and end timestamps would allow future versions to estimate actual production loss rather than using downtime hours as a proxy.
+
+---
+
+## 6. Move Toward Production-Loss-Based Risk
+
+With better time alignment, the current:
+
+```text
+Downtime Hours
+```
+
+component could eventually become:
+
+```text
+Estimated Production Lost
+×
+Unit Economic Value
+```
+
+That would move prioritization closer to direct economic exposure.
+
+---
+
+# Business Impact
+
+The project changes maintenance prioritization from:
+
+> **Which asset looks worst?**
+
+to:
+
+> **Which asset creates the greatest combined operational burden, and where should limited maintenance capacity go first?**
+
+That produces several practical improvements.
+
+### Better allocation of maintenance capacity
+
+Engineering effort is directed toward assets carrying the strongest combination of downtime, recurring failure, and maintenance spend.
+
+### Less dependence on intuition
+
+Priority is based on a documented scoring framework rather than whichever metric or stakeholder receives the most attention.
+
+### Earlier identification of chronic assets
+
+Equipment that performs poorly across several dimensions becomes visible even when it does not top any individual ranking.
+
+### More defensible maintenance planning
+
+Weights and score components are visible, allowing operations teams to understand and challenge the model.
+
+### Workload visibility
+
+Management can see how much work each risk band creates before committing resources.
+
+### Repeatable prioritization
+
+Percentile scoring automatically recalculates as fleet behavior changes.
+
+---
+
+# What Was Built
+
+The completed system includes:
+
+* Asset-Level Reliability Model
+* Failure Frequency Analysis
+* Downtime Exposure Analysis
+* Maintenance Cost Analysis
+* Emissions vs. Failure Comparison
+* Multi-Dimensional High-Risk Asset Detection
+* 0 to 100 Asset Risk Score
+* Weighted Risk Contributions
+* Maintenance Priority Bands
+* Priority Band Capacity Analysis
+* Final Maintenance Worklist
+
+The project also corrected:
+
+* Three-table join fan-out
+* Invalid failure counting
+* Conflicting risk definitions
+* Sequential priority inversion
+* Missing maintenance event identifiers
+* Non-repeatable view creation
+
+---
+
+# Tools & SQL Techniques
+
+### PostgreSQL 14
+
+Used for the complete reliability model and prioritization workflow.
+
+### Common Table Expressions
+
+Each operational source is aggregated independently before joining, preventing one-to-many fan-out.
+
+### `PERCENT_RANK()`
+
+Normalizes downtime, failure frequency, and maintenance cost onto comparable relative scales.
+
+### `PERCENTILE_CONT()`
+
+Creates fleet-relative intervention thresholds such as the top 10% for failure frequency and downtime.
+
+### `NTILE(4)`
+
+Creates readable emissions quartiles for group-level comparison.
+
+### `MODE() WITHIN GROUP`
+
+Identifies each asset's most common recorded failure type.
+
+### `CROSS JOIN`
+
+Makes calculated percentile thresholds available across the relevant asset records without recalculating them row by row.
+
+### `BIGSERIAL PRIMARY KEY`
+
+Creates a reliable maintenance-event identifier where the original source lacked one.
+
+### `NULLIF()`
+
+Protects calculations against divide-by-zero conditions.
+
+### `NULLS LAST`
+
+Keeps unavailable production or emissions values from distorting ranked outputs.
+
+### `CREATE OR REPLACE VIEW`
+
+Allows the analytical pipeline to be rerun without manually removing the existing view.
+
+---
+
+# Results
+
+The final SQL workflow produces six decision layers.
+
+| Output                        | Business Use                                                       |
+| ----------------------------- | ------------------------------------------------------------------ |
+| Asset Reliability View        | Creates one trusted asset-level reliability source                 |
+| Emissions & Failure Analysis  | Tests whether environmental and reliability patterns move together |
+| Severe Multi-Dimensional Risk | Identifies assets in the top 10% for both failures and downtime    |
+| Asset Risk Score              | Ranks the entire fleet from 0 to 100                               |
+| Priority Band Summary         | Measures workload and downtime exposure by intervention level      |
+| Maintenance Worklist          | Gives planners the highest-priority assets requiring action        |
+
+The most important result is operational:
+
+**3,000 maintenance events are converted into one ranked maintenance decision process.**
+
+Instead of separate cost, downtime, and failure reports competing for attention, the maintenance team gets:
+
+```text
+WHAT NEEDS ATTENTION
+        +
+WHY IT NEEDS ATTENTION
+        +
+HOW URGENT IT IS
+        +
+HOW MUCH WORK THE LIST CREATES
+```
+
+That makes the output useful not only for reliability analysis, but for **actual maintenance planning and resource allocation**.
+
+---
+
+# Repository Structure
+
+```text
 03-asset-risk-prioritisation/
 ├── README.md
 └── asset_risk_prioritisation.sql
 ```
 
-### Running it
+---
+
+# Running the Project
+
+Requires PostgreSQL 12 or later. Developed against PostgreSQL 14.
 
 ```bash
 psql -d rigwatch -f sql/00_schema.sql
 psql -d rigwatch -f 03-asset-risk-prioritisation/asset_risk_prioritisation.sql
 ```
 
-Uncomment the `\copy` lines in the schema file first, and check the CSVs are in `data/`.
+Before running the schema, uncomment the required `\copy` statements and confirm the source CSV files are available in the repository's `data/` directory.
+
+---
+
+## Data Limitations
+
+This project should be interpreted as a **maintenance prioritization and reliability decision-support system**, not a predictive failure model.
+
+The available data does not provide sufficient time alignment to establish production loss around individual failure events, and production readings cover wells only.
+
+The current score therefore prioritizes assets using observed maintenance burden:
+
+* Downtime
+* Failure frequency
+* Maintenance cost
+
+With timestamp-aligned production, operating state, asset criticality, repair history, and replacement-cost data, the framework could be extended into a more comprehensive **asset criticality and predictive maintenance system**.
