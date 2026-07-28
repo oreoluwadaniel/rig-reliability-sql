@@ -1,241 +1,1084 @@
-# Project 01: Maintenance Cost Exposure and Spend Efficiency
+# Maintenance Spend & Asset Efficiency Intelligence
 
-**Where is the maintenance budget going, and is it going to assets that earn their keep?**
-
-Script: [`maintenance_cost_analysis.sql`](maintenance_cost_analysis.sql)
-Database: PostgreSQL 14
-Setup required: run [`../sql/00_schema.sql`](../sql/00_schema.sql) first
+**A PostgreSQL asset economics project that connects maintenance expenditure with production output to identify cost concentration, inefficient wells, potential shut-in candidates, and where maintenance budget can create the greatest operational value.**
 
 ---
 
-## 1. Business Problem
+## Business Problem
 
-A maintenance budget gets approved once a year and spent three thousand times. By the time anyone looks at the total, the money is gone and nobody can say what it bought.
+Knowing how much was spent on maintenance is accounting.
 
-The specific problem here is that maintenance spend is recorded at event level. Every repair has a cost, a date and an asset. What nobody has is the view that sits above that: which assets are quietly absorbing a disproportionate share of the budget year after year, and whether those assets are worth the money.
+Knowing whether that spend is economically justified is a business decision.
 
-That second half is the part that usually gets skipped. It is easy to rank assets by cost and hand over a list of the ten most expensive. It is more useful, and more uncomfortable, to put that spend next to what the asset actually produced. An expensive well that produces heavily is doing its job. An expensive well that produces very little is a candidate for shutting in, and that decision is worth far more than any efficiency saving on the repair itself.
+A maintenance team can report every repair, every invoice, and every dollar spent and still be unable to answer the question management actually cares about:
 
-So the question the business is really asking is not "what did we spend". It is "which of these assets should we stop spending on".
+> **Are we spending maintenance money on assets that are worth maintaining?**
 
-## 2. Data Source
+Raw maintenance cost cannot answer that.
 
-Two tables out of the ten CSV files in this dataset.
+A well may absorb significant maintenance spend because it is one of the operation's highest-producing assets. That may be entirely justified.
 
-**`maintenance.csv`** carries 3,000 maintenance events. Each row is one repair with the asset it was performed on, the date, the cost in US dollars, the type of failure, and how many hours the asset was out of service.
+Another well may consume less maintenance budget but produce so little that every barrel becomes expensive to keep online.
 
-| Column | What it holds |
-|---|---|
-| `asset_id` | The asset. Prefix says what kind: WEL, PIP or REF |
-| `maintenance_date` | When the work happened |
-| `cost_usd` | What it cost |
-| `failure_type` | Category of fault, for example Pump Failure or Corrosion |
-| `downtime_hours` | Hours out of service |
+Those two assets should not receive the same decision.
 
-**`production.csv`** carries 5,000 production readings, one per well per date, with oil and gas volumes plus the operating conditions at the time.
+The real problem is therefore not simply controlling maintenance cost.
 
-| Column | What it holds |
-|---|---|
-| `well_id` | The well |
-| `production_date` | Date of the reading |
-| `oil_production_barrels` | Barrels of oil |
-| `gas_production_mcf` | Thousand cubic feet of gas |
-| `water_cut_pct`, `pressure_psi`, `temperature_c` | Operating conditions |
+It is **allocating maintenance resources according to asset value.**
 
-The data spans multiple years and covers wells, pipelines and refineries across several operators and countries.
+This project builds that decision layer by combining maintenance expenditure, repair frequency, downtime, asset type, production output, and cost efficiency into one analytical framework.
 
-**One thing to know before reading any output from this project.** The maintenance table covers all three asset types. The production table only covers wells. Any comparison of spend against barrels can therefore only be made for wells. That is not a flaw in the data, it just means the analysis has to be explicit about which assets it is talking about, and this one is.
+The analysis answers:
 
-## 3. Methodology
+* Where is maintenance budget concentrated?
+* Which assets repeatedly consume maintenance resources?
+* Is high spend caused by recurring repairs or isolated major work?
+* Which asset classes account for the largest share of maintenance expenditure?
+* Which wells justify their maintenance cost through production?
+* Which wells consume significant maintenance resources while producing little?
+* Which maintained wells have no production record at all?
+* Is maintenance expenditure improving or escalating over time?
 
-The work went in this order.
+The result moves maintenance reporting from:
 
-First, get the totals right. Spend per asset, event count, average cost per event. This is the base layer and everything else sits on it, so it has to be exact before anything gets built on top.
+> **What did we spend?**
 
-Second, work out whether the totals matter. A ranked list is only actionable if the top of it is where the money is. So the second step calculates each asset's share of total spend and a running cumulative share. If the top fifty assets account for half the budget, there is a shortlist worth managing. If it takes eight hundred assets to reach half, there is no shortlist and the answer has to be a policy change instead. This distinction decides what kind of recommendation is even possible, so it comes before the recommendation, not after.
+to:
 
-Third, roll the same spend up to asset type. Individual asset numbers are for maintenance planners. Someone who owns a budget needs to know whether the problem is in the wells, the pipelines or the refineries.
+> **Where should we keep spending, where should we investigate, and where should we reconsider the asset altogether?**
 
-Fourth, put spend next to production. This is where the analysis stops describing and starts judging. Cost per barrel is the metric that turns a maintenance number into a commercial one.
+---
 
-Fifth, band the result. A cost per barrel figure on its own leaves the reader to work out what counts as bad. The bands do that work, and they are set from the distribution of the data rather than from a fixed number, so they stay meaningful when the data refreshes.
+# Business Value
 
-Sixth, add time. Nothing in the original script looked at trend, which meant a budget that had doubled over the period would have been invisible. Direction is usually more persuasive than position.
+Maintenance budgets are constrained.
 
-## 4. Analysis and Error Check
+The objective is therefore not simply to minimize maintenance spend.
 
-I reviewed the original script line by line before rewriting anything. These are the problems I found in the two queries that belong to this project, and what I did about each.
+Cutting maintenance indiscriminately can destroy more value than it saves.
 
-### Money stored as text and cast to FLOAT
+The better objective is:
 
-The original wrote `SUM(CAST(cost_usd AS FLOAT))`. Two things wrong with that.
+> **Direct maintenance capacity toward assets where continued spend is economically justified.**
 
-The cast tells you the column was loaded as text, which means the database was never enforcing that these values are numbers. Anything malformed in the source file would have loaded silently and then failed or misbehaved at query time.
+The decision framework looks like this:
 
-FLOAT is a binary floating point type. It cannot represent most decimal fractions exactly. Summing thousands of currency values in FLOAT accumulates small rounding errors, and while the drift is tiny, it means two people running the same query on the same data can print slightly different totals. That is a bad property for a number that goes in front of a finance team.
+```text
+                    MAINTENANCE SPEND
+                           |
+             +-------------+-------------+
+             |                           |
+             v                           v
+       HOW MUCH?                    HOW OFTEN?
+       Total Spend                Event Frequency
+             |                           |
+             +-------------+-------------+
+                           |
+                           v
+                 WHERE IS SPEND
+                   CONCENTRATED?
+                           |
+                           v
+                  WHAT ASSET TYPE?
+                           |
+                           v
+                   WHAT DOES THE
+                     ASSET PRODUCE?
+                           |
+                           v
+                   COST PER BARREL
+                           |
+             +-------------+-------------+
+             |                           |
+             v                           v
+       HIGH OUTPUT                 LOW OUTPUT
+       HIGH SPEND                  HIGH SPEND
+             |                           |
+             v                           v
+      SPEND MAY BE                INVESTIGATE
+       JUSTIFIED                  ECONOMICS
+                                         |
+                              +----------+----------+
+                              |                     |
+                              v                     v
+                         REPAIR / OPTIMIZE      SHUT-IN REVIEW
+```
 
-**Fixed** by declaring `cost_usd` as `NUMERIC(14,2)` in the schema and removing every cast.
+The purpose is not to automatically label expensive assets as bad.
 
-### The join fan-out in the spend versus production query
+It is to distinguish **productive expenditure from inefficient expenditure.**
 
-This was the real bug. The original was:
+---
+
+# What the Analysis Answers
+
+The project produces seven decision layers.
+
+### 1. Maintenance Spend Exposure
+
+Which assets consume the most maintenance budget?
+
+### 2. Spend Concentration
+
+How much of total maintenance expenditure is concentrated in a relatively small part of the fleet?
+
+### 3. Asset-Class Cost Exposure
+
+Are wells, pipelines, or refineries driving the maintenance budget?
+
+### 4. Maintenance Cost vs. Production
+
+Does the output from each well justify the maintenance expenditure associated with it?
+
+### 5. Missing Production Exposure
+
+Which wells continue to receive maintenance spend despite having no production record?
+
+### 6. Cost Efficiency Segmentation
+
+Which wells sit at the inefficient end of the fleet when maintenance cost is measured against production?
+
+### 7. Maintenance Spend Trend
+
+Is the maintenance burden improving, stable, or increasing over time?
+
+---
+
+# Data
+
+The project uses two operational datasets.
+
+| Dataset           | Records | Role                                                  |
+| ----------------- | ------: | ----------------------------------------------------- |
+| `maintenance.csv` |   3,000 | Maintenance expenditure, failure events, and downtime |
+| `production.csv`  |   5,000 | Well production volumes and operating conditions      |
+
+---
+
+## Maintenance Data
+
+Each row represents one maintenance event.
+
+Key fields include:
+
+| Field              | Purpose                             |
+| ------------------ | ----------------------------------- |
+| `asset_id`         | Identifies the asset                |
+| `maintenance_date` | Date maintenance occurred           |
+| `cost_usd`         | Cost of the maintenance event       |
+| `failure_type`     | Recorded equipment failure category |
+| `downtime_hours`   | Hours the asset was unavailable     |
+
+Asset IDs also encode equipment class:
+
+```text
+WEL → Well
+PIP → Pipeline
+REF → Refinery
+```
+
+This becomes important when maintenance expenditure is compared with production.
+
+---
+
+## Production Data
+
+Production records contain:
+
+* Oil production
+* Gas production
+* Water cut
+* Pressure
+* Temperature
+
+The production table contains **well data only**.
+
+Pipelines and refineries therefore remain part of maintenance cost analysis but are excluded from cost-per-barrel calculations.
+
+That distinction prevents assets from being incorrectly classified as unproductive simply because production data does not apply to their asset type.
+
+---
+
+# Analytical Framework
+
+The analysis moves from financial exposure to asset economics.
+
+```text
+MAINTENANCE EVENTS
+        |
+        v
+TOTAL SPEND BY ASSET
+        |
+        v
+SPEND FREQUENCY & EVENT SIZE
+        |
+        v
+SPEND CONCENTRATION
+        |
+        v
+ASSET CLASS
+        |
+        v
+PRODUCTION OUTPUT
+        |
+        v
+MAINTENANCE COST PER BARREL
+        |
+        v
+EFFICIENCY SEGMENT
+        |
+        v
+MAINTENANCE PRIORITY
+```
+
+Each stage narrows the decision.
+
+---
+
+# Methodology
+
+## Step 1: Establish Maintenance Cost Exposure
+
+The first layer measures:
+
+* Total maintenance spend per asset
+* Number of maintenance events
+* Average cost per event
+* Largest individual maintenance event
+* First and most recent maintenance dates
+
+Total cost alone is not enough.
+
+Consider:
+
+```text
+Asset A
+$200,000 maintenance spend
+2 events
+
+Asset B
+$200,000 maintenance spend
+20 events
+```
+
+Same total cost.
+
+Different problem.
+
+Asset A may have undergone major scheduled work.
+
+Asset B may be experiencing repeated faults that continue consuming maintenance resources.
+
+The event count and average event cost make that distinction visible.
+
+---
+
+# Step 2: Determine Whether Spend Is Concentrated
+
+A ranked cost list tells you who spent the most.
+
+It does not tell you whether focusing on those assets will materially change the budget.
+
+The project therefore calculates:
+
+* Asset maintenance spend
+* Percentage of total maintenance expenditure
+* Running cumulative share of expenditure
+
+Conceptually:
+
+```text
+Assets Ranked by Maintenance Spend
+
+Asset 01  █████████████████
+Asset 02  █████████████
+Asset 03  ██████████
+Asset 04  ███████
+Asset 05  █████
+...
+```
+
+The cumulative calculation answers a strategic question:
+
+> **How many assets account for a major share of maintenance expenditure?**
+
+If a small group drives half the spend, targeted intervention is realistic.
+
+If hundreds of assets are required to reach the same threshold, the issue is more systemic and may require maintenance policy changes rather than asset-by-asset action.
+
+The concentration analysis therefore determines what kind of intervention is practical before one is recommended.
+
+---
+
+# Step 3: Understand Spend by Asset Class
+
+Individual asset rankings support maintenance planners.
+
+Management also needs to understand where maintenance expenditure sits across the operation.
+
+The analysis therefore rolls spend up by:
+
+* Wells
+* Pipelines
+* Refineries
+
+This provides:
+
+* Total spend by asset class
+* Number of assets maintained
+* Average spend per asset
+
+That makes it possible to distinguish a fleet-wide maintenance issue from a problem concentrated in one equipment class.
+
+---
+
+# Step 4: Connect Maintenance Spend to Production
+
+This is where maintenance reporting becomes asset economics.
+
+Raw maintenance spend asks:
+
+> How expensive is this asset?
+
+Cost per barrel asks:
+
+> **How expensive is this asset relative to what it produces?**
+
+The metric is:
+
+```text
+Maintenance Cost per Barrel
+=
+Total Maintenance Cost
+÷
+Total Oil Production
+```
+
+This changes the ranking.
+
+A high-maintenance well with strong production may remain economically reasonable.
+
+A moderate-maintenance well with weak production may be far more concerning.
+
+Example:
+
+```text
+Well A
+Maintenance Spend: $500,000
+Production: 500,000 barrels
+
+Cost per Barrel: $1.00
+```
+
+versus:
+
+```text
+Well B
+Maintenance Spend: $200,000
+Production: 20,000 barrels
+
+Cost per Barrel: $10.00
+```
+
+Well A costs more in absolute terms.
+
+Well B carries ten times the maintenance burden per barrel.
+
+A raw cost ranking prioritizes Well A.
+
+An efficiency ranking surfaces Well B.
+
+That is why spend cannot be interpreted without output.
+
+---
+
+# SQL Review & Model Corrections
+
+The original analysis contained one structural issue that materially affected the business conclusion.
+
+## 1. Maintenance and Production Were Joined at the Wrong Grain
+
+The original pattern was:
 
 ```sql
-SELECT m.asset_id,
-       SUM(m.cost_usd) AS maintenance_cost,
-       SUM(p.oil_production_barrels) AS production
+SELECT
+    m.asset_id,
+    SUM(m.cost_usd) AS maintenance_cost,
+    SUM(p.oil_production_barrels) AS production
 FROM maintenance m
-LEFT JOIN production p ON m.asset_id = p.well_id
+LEFT JOIN production p
+    ON m.asset_id = p.well_id
 GROUP BY m.asset_id;
 ```
 
-Both tables hold multiple rows per asset. The join runs before the aggregation, so it produces one row for every possible pairing of a maintenance event with a production reading. An asset with 4 maintenance events and 3 production readings comes out of that join as 12 rows.
+Both tables contain multiple records per asset.
 
-The consequence is that `SUM(m.cost_usd)` counts each cost three times and `SUM(p.oil_production_barrels)` counts each production figure four times. Both totals are inflated, and the multiplier is different for every asset depending on how many rows it happens to have on each side. You cannot even correct for it after the fact.
+Suppose a well has:
 
-What makes this one dangerous rather than just wrong is that the output looks completely reasonable. There are no nulls, no errors, no obviously silly numbers. The totals are simply too big, by an amount that varies per row.
+```text
+4 maintenance records
+3 production records
+```
 
-**Fixed** by aggregating each table to one row per asset in a CTE, then joining the two summaries. Each asset now contributes its cost once and its production once.
+Joining the raw tables produces:
 
-### The same query missed the asset type problem
+```text
+4 × 3 = 12 rows
+```
 
-`maintenance.asset_id` contains WEL, PIP and REF assets. `production.well_id` contains only wells. The LEFT JOIN therefore returns NULL production for every pipeline and every refinery.
+Each maintenance record is repeated for every production record.
 
-Sitting in the same output as the wells, those assets read as "high spend, no production", which is a damning description of something that is behaving exactly as designed. A refinery does not produce barrels because it is a refinery.
+Each production record is repeated for every maintenance record.
 
-**Fixed** two ways. An `asset_class()` helper function labels every asset from its ID prefix, and the cost per barrel query filters to wells only. Pipelines and refineries get their own summary in query 1.3 where the comparison is like for like.
+The resulting totals are inflated.
 
-### No table definitions at all
+Worse, the amount of inflation depends on how many records each asset has.
 
-The original script started with a `CREATE VIEW`. There were no `CREATE TABLE` statements, no data types, no keys and no load instructions. It assumed the tables already existed somewhere.
+That means the error is not uniform across the fleet.
 
-For a portfolio piece that is a real gap, because nobody can run it. It also hid the FLOAT problem, since the column types were never stated anywhere.
+The SQL runs successfully.
 
-**Fixed** with a full `00_schema.sql` containing table definitions, load commands, indexes and a set of sanity checks to run after loading.
+The output can look reasonable.
 
-### `CREATE VIEW` instead of `CREATE OR REPLACE VIEW`
-
-Small thing, but it means the script fails on the second run. Anyone reviewing your work will run it more than once.
-
-**Fixed** in the schema file, which drops cleanly, and in project 03 which uses `CREATE OR REPLACE VIEW`.
-
-### What I checked and found nothing wrong with
-
-The two cost queries in the original were logically correct in their grouping. `SUM(cost_usd) GROUP BY asset_id` does exactly what it claims. I have kept that logic and added context columns around it rather than changing it.
-
-## 5. Insight
-
-Three things come out of this analysis, and they build on each other.
-
-**Total spend is the wrong headline.** The number that matters is how concentrated it is. The cumulative share column in query 1.2 answers a question the original script could not: is there a shortlist here at all? Read down that column to where it crosses 50 percent, and the count of assets above that line is the actual size of the problem. Everything below the line is noise that no amount of targeted intervention will fix.
-
-**Cost per event and event count tell different stories, and the difference is the diagnosis.** An asset with high total spend across two events had a major overhaul, which is normal and expected. An asset with the same spend across twenty events has a fault nobody has traced to root cause. The original ranking could not tell these apart because it reported only the total. Query 1.1 puts the count and the average next to the total precisely so the reader can separate them at a glance.
-
-**Spend only becomes meaningful next to output.** Cost per barrel reorders the list completely compared to raw cost, and it reorders it in the direction the business cares about. The most expensive well in the field is often a heavy producer where the spend is justified. The wells that should worry you sit in the middle of the cost ranking and near the bottom of the production ranking. Those never appear on a list sorted by cost, which is why the original analysis would have pointed the maintenance team at the wrong assets.
-
-There is also a fourth finding that comes from the error check rather than the data. **The original comparison of spend against production was returning inflated figures for both sides.** Any decision taken from that output was taken on numbers that were wrong. That matters more than any single insight below it, because it means the previous conclusions need revisiting, not just extending.
-
-## 6. Recommendation
-
-**Manage the top of the cost curve as a named list, not as a budget line.** Take the assets above the 50 percent cumulative threshold from query 1.2 and give each one an owner. This works only if the count is small enough to be real. Query 1.2 tells you whether it is.
-
-**Sort the shortlist by cost per barrel, not by cost.** The maintenance team should be reviewing the worst quarter from query 1.6, not the top of query 1.1. These are different sets of assets and only one of them represents money being wasted.
-
-**Split the response by what the numbers say about the fault.** High spend concentrated in a few large events points at planning and spares. High spend spread across many small events points at root cause. Same budget impact, completely different fix, and query 1.1 tells you which one you are looking at before anyone visits the site.
-
-**Resolve the wells in query 1.5 before the next budget cycle.** These are wells with maintenance spend and no production record at all. Either they are shut in and still being maintained, which is a decision someone should be making deliberately, or the production data has a gap, which undermines every cost per barrel figure in the analysis. Both need answering and they need different people to answer them.
-
-**Set the maintenance budget from the trend in query 1.7, not from last year plus inflation.** If spend is rising year on year, the flat budget is already a decision to defer work, and it should be made openly rather than by default.
-
-## 7. Business Impact
-
-The change this analysis makes is in where maintenance money goes, not in how much of it there is.
-
-**Attention moves to the assets that deserve it.** Prioritising by cost per barrel instead of raw cost redirects the review effort towards genuinely inefficient assets. Some of the highest cost assets turn out to be fine and drop off the list. Some mid ranking ones turn out to be the real problem and move up it. The budget does not change and the outcome does.
-
-**Shut in candidates become visible.** A well with meaningful maintenance spend and negligible production is a well that costs more to keep than it returns. Nobody spots these by looking at a cost ranking, because they are not at the top of it. Query 1.6 puts them in the worst efficiency band by construction. This is usually the single largest saving available, because stopping spend entirely beats reducing it.
-
-**Decisions stop being made on inflated numbers.** The fan-out fix is not a refinement. The previous spend against production comparison was returning wrong totals on both sides, so any conclusion drawn from it was unreliable. Correcting it restores the ability to make the comparison at all.
-
-**Budget conversations get a direction.** Query 1.7 turns "we spent this much" into "we are spending this much more each year". That is a different conversation and a more productive one.
-
-**Someone else can check the work.** The schema file means a reviewer can load the same data and reproduce every number. Analysis nobody can verify tends not to survive its first challenge.
-
-## 8. What Was Done
-
-Reviewed the two cost related queries in the original script line by line and documented every problem found, including the one that made the output wrong rather than merely incomplete.
-
-Wrote a full PostgreSQL schema with proper types, a primary key on maintenance, indexes on the join columns, load commands for the CSVs, and a set of post load sanity checks.
-
-Rebuilt the spend versus production query using pre-aggregated CTEs to remove the join fan-out, and scoped it to wells so the comparison is valid.
-
-Added an `asset_class()` helper so wells, pipelines and refineries are never silently compared against each other.
-
-Extended the analysis with four things the original did not have: cost concentration with a cumulative share, an asset type rollup, cost per barrel with data driven efficiency bands, and a year on year trend.
-
-Separated out the wells that have maintenance spend but no production record, rather than letting them sit in the main output as NULLs.
-
-Commented the script so each query explains what it answers and, where relevant, what was wrong with the earlier version.
-
-## 9. Tools Used and How They Helped
-
-**PostgreSQL 14.** Free, and its window function support is what makes the concentration and banding analysis possible in plain SQL rather than needing an export to Python.
-
-**Common table expressions.** The single most important technique in this script. Pre-aggregating each table before joining is what fixes the fan-out, and CTEs make that fix readable. The same correction written with subqueries would work and would be much harder for a reviewer to follow, which matters when the point of the code is partly to show your reasoning.
-
-**Window functions.** `SUM() OVER ()` gives each row the grand total without a second pass, which is how the percentage of total column works. `SUM() OVER (ORDER BY ... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` builds the running cumulative share. `LAG()` gives the year on year comparison. All three would otherwise need self joins.
-
-**`NTILE(4)`.** Used for the efficiency bands. Chosen over hardcoded thresholds deliberately: a fixed cut off like 50 dollars a barrel is correct only until costs or volumes move, and then it stops being correct without anyone noticing. Percentile bands describe an asset's position in the fleet, which stays meaningful.
-
-**`NULLIF()`.** Guards every division. Cost per barrel on a well with zero recorded production is a divide by zero, and `NULLIF` turns it into a NULL that can be filtered rather than an error that stops the script.
-
-**`NOT EXISTS`.** Used to isolate wells missing from production. Clearer in intent than a LEFT JOIN with an IS NULL filter, and it does not risk pulling duplicate rows.
-
-**`NUMERIC` over `FLOAT`.** Exact decimal arithmetic for currency. The difference is invisible on one row and matters across three thousand.
-
-**A SQL helper function.** `asset_class()` puts the WEL, PIP and REF logic in one place. If a fourth asset type appears, it changes once instead of in every query.
-
-## 10. Results
-
-The script produces seven outputs, each answering a specific question.
-
-| Query | What it gives you |
-|---|---|
-| 1.1 | Every asset with total spend, event count, average and largest event, and the date range it covers |
-| 1.2 | The same assets ranked, with each one's share of total spend and a running cumulative share |
-| 1.3 | Spend rolled up to wells, pipelines and refineries with per asset averages |
-| 1.4 | Wells with maintenance spend, downtime and production side by side, plus cost per barrel, with the double counting removed |
-| 1.5 | Wells with spend but no production record, isolated for follow up |
-| 1.6 | Wells sorted by cost per barrel and banded into four efficiency groups |
-| 1.7 | Spend, events and downtime by year with change on the previous year |
-
-The concrete outcomes.
-
-Query 1.4 now returns correct figures. The previous version was inflating both maintenance cost and production volume by a multiple that varied per asset. That is the difference between an analysis you can act on and one you cannot.
-
-Query 1.2 answers whether a targeted programme can work at all, before anyone spends time designing one.
-
-Query 1.6 produces a shortlist ordered by commercial efficiency rather than by raw spend. These are not the same assets, and only one of the two lists points at money being wasted.
-
-Query 1.5 surfaces a data quality question that was invisible before and that affects the reliability of everything else in the project.
-
-The schema file means every number here is reproducible by anyone who clones the repository.
+The underlying asset economics are still wrong.
 
 ---
 
-### Files
+## Correction: Aggregate Before Joining
 
+The corrected architecture is:
+
+```text
+MAINTENANCE
+     |
+     v
+Aggregate to
+One Row per Asset
+     |
+     +---------------------+
+                           |
+PRODUCTION                 |
+     |                     |
+     v                     |
+Aggregate to               |
+One Row per Well ----------+
+                           |
+                           v
+                 ASSET ECONOMICS
 ```
+
+Maintenance is summarized independently.
+
+Production is summarized independently.
+
+Only the asset-level summaries are joined.
+
+This ensures each dollar of maintenance spend and each barrel of production is counted once.
+
+---
+
+# 2. Non-Well Assets Were Being Compared With Well Production
+
+The maintenance dataset contains:
+
+```text
+WEL
+PIP
+REF
+```
+
+The production dataset contains wells.
+
+A direct LEFT JOIN therefore gives pipelines and refineries:
+
+```text
+production = NULL
+```
+
+Without asset classification, this can make a perfectly normal refinery appear to be:
+
+> High maintenance cost, zero production.
+
+That is not poor performance.
+
+It is an invalid comparison.
+
+The corrected model introduces an `asset_class()` helper and limits production-efficiency calculations to wells.
+
+Pipelines and refineries are evaluated separately through asset-class maintenance reporting.
+
+---
+
+# 3. Currency Was Stored as Text and Converted to FLOAT
+
+The original analysis used:
+
+```sql
+CAST(cost_usd AS FLOAT)
+```
+
+for financial aggregation.
+
+That creates two problems.
+
+First, storing currency as text means the database is not enforcing numeric integrity at ingestion.
+
+Second, `FLOAT` is an approximate numeric type.
+
+Currency should use exact decimal arithmetic.
+
+The corrected schema defines:
+
+```text
+cost_usd → NUMERIC(14,2)
+```
+
+and removes the runtime casts.
+
+Financial values are therefore validated at load time and aggregated using an appropriate numeric type.
+
+---
+
+# 4. The Original Project Had No Reproducible Schema
+
+The original script assumed tables already existed.
+
+There were no:
+
+* Table definitions
+* Data types
+* Keys
+* Load instructions
+* Indexes
+* Post-load validation checks
+
+That makes the analysis difficult for another person to reproduce and hides structural problems such as incorrect column types.
+
+The project now includes a complete PostgreSQL schema and loading workflow.
+
+---
+
+# Step 5: Surface Maintained Wells With No Production Record
+
+A maintained well with no production record requires investigation.
+
+There are at least two possible explanations.
+
+### Operational Explanation
+
+The well may be shut in or otherwise non-producing while maintenance expenditure continues.
+
+That raises an asset economics question:
+
+> **Why are we continuing to spend on this well?**
+
+### Data Explanation
+
+The well may be producing, but its production records are missing.
+
+That raises a data-quality question:
+
+> **Can we trust the cost-per-barrel calculation for the fleet?**
+
+Those are completely different problems.
+
+The project isolates these wells instead of allowing them to disappear into NULL values inside the main efficiency analysis.
+
+---
+
+# Step 6: Segment Wells by Maintenance Efficiency
+
+A cost-per-barrel number still leaves management with another question:
+
+> What counts as high?
+
+Hardcoding an arbitrary threshold creates a rule that can become stale as fleet economics change.
+
+Instead, the project uses quartiles to compare each well against the current portfolio.
+
+```text
+Best Efficiency
+      |
+      |  Q1
+      |
+      |  Q2
+      |
+      |  Q3
+      |
+      |  Q4
+      v
+Worst Efficiency
+```
+
+This creates four relative efficiency bands.
+
+The worst-performing quartile becomes the first group for commercial review.
+
+This does not mean every asset in that quartile should be shut in.
+
+It means those assets deserve investigation before additional maintenance budget is committed.
+
+---
+
+# Step 7: Track Maintenance Economics Over Time
+
+A maintenance total has limited meaning without direction.
+
+Suppose annual maintenance expenditure is:
+
+```text
+2021    $4.2M
+2022    $4.8M
+2023    $5.6M
+2024    $6.7M
+```
+
+The important information is not only the latest total.
+
+It is the trajectory.
+
+The project therefore tracks:
+
+* Annual maintenance spend
+* Number of maintenance events
+* Annual downtime
+* Change from the previous year
+
+This gives management visibility into whether maintenance burden is:
+
+* Declining
+* Stable
+* Increasing
+
+Budget planning can then respond to operational reality rather than simply rolling last year's number forward.
+
+---
+
+# Key Insights
+
+## High Maintenance Cost Does Not Automatically Mean Poor Performance
+
+An expensive asset may also be one of the fleet's most productive.
+
+Removing it from service because it ranks high on maintenance cost could destroy value.
+
+Maintenance expenditure needs production context.
+
+---
+
+## Cost per Barrel Can Reverse the Priority List
+
+Raw spend prioritizes expensive assets.
+
+Efficiency analysis prioritizes expensive output.
+
+Those are not the same thing.
+
+A moderate-cost well with very low production can be a larger commercial problem than the highest-maintenance well in the portfolio.
+
+---
+
+## Spend Concentration Determines the Strategy
+
+If a small number of assets consume most maintenance expenditure, a targeted program can materially change the budget.
+
+If expenditure is widely distributed, asset-by-asset intervention will have limited effect.
+
+The concentration curve tells management which situation it is dealing with.
+
+---
+
+## Event Frequency Helps Explain Why an Asset Is Expensive
+
+Two assets with equal maintenance spend may require completely different responses.
+
+```text
+Few expensive interventions
+        |
+        v
+Major maintenance work
+        |
+        v
+Planning / spares / overhaul review
+```
+
+versus:
+
+```text
+Many smaller interventions
+        |
+        v
+Recurring reliability issue
+        |
+        v
+Root cause investigation
+```
+
+Total spend identifies the exposure.
+
+Event frequency helps diagnose it.
+
+---
+
+## Missing Production Is a Business Issue, Not Just a NULL
+
+Maintenance spend against a well with no production record should never quietly disappear from an efficiency report.
+
+Either the well is receiving maintenance despite not producing, or the production data is incomplete.
+
+Both require action.
+
+---
+
+## Maintenance Trend Changes the Budget Conversation
+
+A static cost total says:
+
+> We spent $X.
+
+A trend says:
+
+> Maintenance expenditure has increased for three consecutive years.
+
+The second statement supports a management decision.
+
+---
+
+# Recommendations
+
+## 1. Manage Maintenance Spend as an Asset Portfolio
+
+Do not manage the maintenance budget only by department or total spend.
+
+Use the concentration analysis to identify the assets responsible for the largest share of expenditure.
+
+Give those assets explicit ownership and review.
+
+---
+
+## 2. Prioritize Efficiency, Not Absolute Cost
+
+Do not automatically target the highest-cost wells.
+
+Review wells with the highest maintenance cost per barrel first.
+
+These are the assets where maintenance expenditure is least supported by output.
+
+---
+
+## 3. Separate Recurring Repair Problems From Major Work
+
+Use maintenance event count and average event cost together.
+
+### Many events + high cumulative spend
+
+Investigate recurring failure mechanisms.
+
+### Few events + high spend
+
+Review overhaul scope, planning, contractor cost, and parts strategy.
+
+The financial exposure may look identical.
+
+The intervention should not.
+
+---
+
+## 4. Investigate Every Maintained Well With No Production Record
+
+Each one should be classified as either:
+
+```text
+Operational Issue
+```
+
+or:
+
+```text
+Data Issue
+```
+
+If the well is genuinely non-producing, management should determine whether continued maintenance is economically justified.
+
+If production data is missing, the data problem should be corrected before relying on fleet efficiency rankings.
+
+---
+
+## 5. Review the Worst Efficiency Quartile Before the Next Budget Cycle
+
+The worst cost-per-barrel group should become a commercial review list.
+
+Possible decisions may include:
+
+* Continue maintenance
+* Investigate recurring failures
+* Change maintenance strategy
+* Reduce intervention frequency
+* Reassess operating plan
+* Consider shut-in review where operationally appropriate
+
+The SQL does not make those decisions automatically.
+
+It identifies where those decisions deserve attention.
+
+---
+
+## 6. Build Maintenance Budgets From Trend and Asset Economics
+
+Do not set the next budget simply as:
+
+```text
+Last Year's Budget
++
+Inflation
+```
+
+Use:
+
+* Maintenance spend trend
+* Event trend
+* Downtime trend
+* Asset-level cost efficiency
+
+to understand what is actually driving the requirement.
+
+---
+
+# Business Impact
+
+## Maintenance Capital Can Be Allocated More Rationally
+
+The project shifts budget attention from the assets that simply cost the most toward the assets where maintenance cost is least supported by production.
+
+That improves the quality of allocation without assuming the solution is simply to reduce the overall maintenance budget.
+
+---
+
+## Inefficient Wells Become Visible
+
+Assets with weak production and meaningful maintenance expenditure can sit unnoticed in the middle of a raw cost ranking.
+
+Cost-per-barrel analysis moves them into view.
+
+These assets are candidates for deeper technical and commercial review.
+
+---
+
+## Potential Shut-In Candidates Can Be Investigated Earlier
+
+The project does not declare that an inefficient well should be shut in.
+
+It identifies wells where continued maintenance expenditure deserves scrutiny because output is weak relative to cost.
+
+That turns shut-in review from an anecdotal decision into a data-supported investigation.
+
+---
+
+## Maintenance Strategy Can Be Tailored to the Cost Pattern
+
+Recurring low-value repairs and isolated major maintenance events no longer appear as the same problem simply because their annual cost is equal.
+
+That allows engineering, planning, and procurement teams to respond differently.
+
+---
+
+## Budget Concentration Becomes Visible
+
+Management can see whether maintenance exposure sits in a manageable group of assets or is distributed across the operation.
+
+That determines whether targeted intervention or broader policy change is likely to produce the better return.
+
+---
+
+## Financial Comparisons Are Built on Correct Totals
+
+The aggregate-before-join correction removes the row multiplication that previously inflated maintenance and production totals.
+
+Without this correction, cost-per-barrel comparisons could rank assets using distorted economics.
+
+With it, asset-level comparisons become usable for decision support.
+
+---
+
+# What Was Built
+
+The completed project includes:
+
+* Asset Maintenance Spend Analysis
+* Maintenance Event Frequency Analysis
+* Spend Concentration Analysis
+* Asset-Class Cost Analysis
+* Maintenance Cost vs. Production Analysis
+* Missing Production Investigation
+* Cost-per-Barrel Efficiency Segmentation
+* Year-over-Year Maintenance Trend Analysis
+
+The project also corrected:
+
+* Many-to-many join fan-out
+* Invalid production comparisons across asset classes
+* Approximate financial arithmetic
+* Missing schema and reproducibility controls
+* Missing production records being buried inside NULL outputs
+
+---
+
+# Tools & SQL Techniques
+
+### PostgreSQL 14
+
+Used for the complete analysis and data model.
+
+### Common Table Expressions
+
+Used to aggregate maintenance and production independently before joining them.
+
+This is the key architectural correction that prevents duplicated totals.
+
+### Window Functions
+
+Used for:
+
+* Percentage of total spend
+* Running cumulative expenditure
+* Efficiency segmentation
+* Year-over-year comparison
+
+### `SUM() OVER()`
+
+Calculates each asset's contribution to total maintenance spend.
+
+### Running `SUM() OVER()`
+
+Builds the cumulative spend curve used to measure cost concentration.
+
+### `LAG()`
+
+Compares annual maintenance performance against the previous year.
+
+### `NTILE(4)`
+
+Creates relative cost-efficiency quartiles without relying on arbitrary fixed thresholds.
+
+### `NULLIF()`
+
+Prevents divide-by-zero errors when calculating maintenance cost per barrel.
+
+### `NOT EXISTS`
+
+Isolates maintained wells without corresponding production records.
+
+### `NUMERIC(14,2)`
+
+Provides exact decimal storage and calculation for maintenance expenditure.
+
+### `asset_class()`
+
+Centralizes the logic used to distinguish wells, pipelines, and refineries from asset IDs.
+
+---
+
+# Results
+
+The SQL workflow produces seven decision-ready outputs.
+
+| Output                       | Decision Supported                                                 |
+| ---------------------------- | ------------------------------------------------------------------ |
+| Asset Spend Profile          | Identifies where maintenance money is being consumed               |
+| Spend Concentration          | Determines whether targeted cost intervention is viable            |
+| Asset-Class Spend            | Shows which equipment classes drive maintenance exposure           |
+| Cost vs. Production          | Measures whether well output supports maintenance expenditure      |
+| Missing Production Watchlist | Flags maintained wells requiring operational or data investigation |
+| Efficiency Segmentation      | Identifies the least efficient wells relative to the fleet         |
+| Maintenance Trend            | Shows whether maintenance burden is improving or escalating        |
+
+The project ultimately transforms:
+
+```text
+3,000 MAINTENANCE EVENTS
+          |
+          v
+     WHERE DID THE
+       MONEY GO?
+          |
+          v
+     WHICH ASSETS
+     CONSUME MOST?
+          |
+          v
+    WHAT DO THOSE
+     ASSETS PRODUCE?
+          |
+          v
+   WHAT DOES MAINTENANCE
+      COST PER BARREL?
+          |
+          v
+   WHICH ASSETS JUSTIFY
+     CONTINUED SPEND?
+          |
+          v
+    WHERE SHOULD THE
+     NEXT MAINTENANCE
+       DOLLAR GO?
+```
+
+That is the core business value of the project.
+
+It turns historical maintenance transactions into an **asset economics and maintenance allocation system.**
+
+---
+
+# Data & Interpretation Limits
+
+This analysis measures maintenance efficiency using the information available in the dataset.
+
+It should not be interpreted as a complete asset profitability model.
+
+Maintenance cost per barrel does not include:
+
+* Revenue per barrel
+* Commodity price
+* Operating expenditure outside maintenance
+* Transportation cost
+* Taxes
+* Royalties
+* Capital expenditure
+* Remaining reserves
+* Expected future production
+* Decommissioning cost
+
+Therefore:
+
+> **High maintenance cost per barrel is a review signal, not an automatic shut-in decision.**
+
+A production asset can carry relatively high maintenance cost and still remain commercially attractive once revenue and future reserves are considered.
+
+A true shut-in or asset-retirement model would require those additional economic inputs.
+
+The purpose of this project is narrower and defensible:
+
+> **Identify where maintenance expenditure appears least efficient relative to recorded production so management knows where deeper commercial review should begin.**
+
+---
+
+# Repository Structure
+
+```text
 01-maintenance-cost-analysis/
 ├── README.md
 └── maintenance_cost_analysis.sql
 ```
 
-### Running it
+---
+
+# Running the Project
+
+Requires PostgreSQL 12 or later. Developed against PostgreSQL 14.
 
 ```bash
 psql -d rigwatch -f sql/00_schema.sql
 psql -d rigwatch -f 01-maintenance-cost-analysis/maintenance_cost_analysis.sql
 ```
 
-Uncomment the `\copy` lines in the schema file first, and check the CSVs are in `data/`.
+Before running the schema, uncomment the required `\copy` statements and confirm the source CSV files are available in the repository's `data/` directory.
